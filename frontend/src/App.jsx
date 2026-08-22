@@ -7,7 +7,8 @@ function App() {
   const [messages, setMessages] = useState([
     {
       role: "assistant",
-      content: "Hey! Welcome to NextFit 👋 How can I help you today?",
+      content:
+        "Hey, welcome to NextFit 👋 What brings you in today?",
     },
   ]);
 
@@ -29,6 +30,10 @@ function App() {
 
   const recognitionRef = useRef(null);
   const messagesEndRef = useRef(null);
+
+  // ============================================================
+  // SPEECH RECOGNITION
+  // ============================================================
 
   useEffect(() => {
     const SpeechRecognition =
@@ -107,9 +112,7 @@ function App() {
           break;
 
         default:
-          setVoiceError(
-            `Voice error: ${event.error}`
-          );
+          setVoiceError(`Voice error: ${event.error}`);
       }
     };
 
@@ -119,20 +122,41 @@ function App() {
 
     recognitionRef.current = recognition;
 
+    // Initialize browser speech voices
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.getVoices();
+
+      window.speechSynthesis.onvoiceschanged = () => {
+        window.speechSynthesis.getVoices();
+      };
+    }
+
     return () => {
       try {
         recognition.abort();
       } catch {
         // Ignore cleanup errors.
       }
+
+      if ("speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
     };
   }, []);
+
+  // ============================================================
+  // AUTO SCROLL
+  // ============================================================
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
       behavior: "smooth",
     });
   }, [messages, loading]);
+
+  // ============================================================
+  // FEMALE VOICE SELECTION
+  // ============================================================
 
   const getPreferredVoice = () => {
     if (!("speechSynthesis" in window)) {
@@ -145,55 +169,112 @@ function App() {
       return null;
     }
 
-    const maleKeywords = [
-      "male",
-      "man",
-      "david",
-      "mark",
-      "ravi",
-      "aaron",
-      "daniel",
-      "alex",
-      "guy",
-      "george",
+    /*
+     * Preferred natural female voices.
+     *
+     * Voice availability depends on:
+     * - Windows
+     * - Chrome
+     * - installed language packs
+     * - browser speech engine
+     */
+
+    const preferredNames = [
+      "Google UK English Female",
+      "Google US English Female",
+      "Microsoft Zira",
+      "Microsoft Jenny",
+      "Microsoft Aria",
+      "Samantha",
+      "Karen",
+      "Moira",
+      "Aditi",
+      "Veena",
+      "Heera",
     ];
 
-    const indianVoices = voices.filter((voice) =>
-      /en[-_]IN/i.test(voice.lang)
-    );
+    // ----------------------------------------------------------
+    // 1. Exact preferred female voices
+    // ----------------------------------------------------------
 
-    const indianMale = indianVoices.find((voice) =>
-      maleKeywords.some((keyword) =>
-        voice.name.toLowerCase().includes(keyword)
-      )
-    );
+    for (const preferred of preferredNames) {
+      const match = voices.find((voice) =>
+        voice.name
+          .toLowerCase()
+          .includes(preferred.toLowerCase())
+      );
 
-    if (indianMale) {
-      return indianMale;
+      if (match) {
+        return match;
+      }
     }
 
-    if (indianVoices.length) {
-      return indianVoices[0];
-    }
+    // ----------------------------------------------------------
+    // 2. Female voice keywords
+    // ----------------------------------------------------------
 
-    const englishMale = voices.find(
+    const femaleKeywords = [
+      "female",
+      "woman",
+      "zira",
+      "jenny",
+      "aria",
+      "samantha",
+      "karen",
+      "moira",
+      "veena",
+      "aditi",
+      "heera",
+      "google uk english female",
+      "google us english female",
+    ];
+
+    const englishFemale = voices.find(
       (voice) =>
         /^en[-_]/i.test(voice.lang) &&
-        maleKeywords.some((keyword) =>
-          voice.name.toLowerCase().includes(keyword)
+        femaleKeywords.some((keyword) =>
+          voice.name
+            .toLowerCase()
+            .includes(keyword)
         )
     );
 
-    if (englishMale) {
-      return englishMale;
+    if (englishFemale) {
+      return englishFemale;
     }
 
-    return (
-      voices.find((voice) =>
-        /^en[-_]/i.test(voice.lang)
-      ) || voices[0]
+    // ----------------------------------------------------------
+    // 3. Indian English voice
+    // ----------------------------------------------------------
+
+    const indianEnglish = voices.find(
+      (voice) =>
+        /en[-_]IN/i.test(voice.lang)
     );
+
+    if (indianEnglish) {
+      return indianEnglish;
+    }
+
+    // ----------------------------------------------------------
+    // 4. Any English voice
+    // ----------------------------------------------------------
+
+    const englishVoice = voices.find(
+      (voice) =>
+        /^en[-_]/i.test(voice.lang)
+    );
+
+    if (englishVoice) {
+      return englishVoice;
+    }
+
+    return voices[0];
   };
+
+  // ============================================================
+  // SPEAK RESPONSE
+  // ============================================================
 
   const speakResponse = (text) => {
     if (!("speechSynthesis" in window)) {
@@ -214,8 +295,16 @@ function App() {
       utterance.lang = "en-IN";
     }
 
-    utterance.rate = 0.94;
-    utterance.pitch = 0.88;
+    /*
+     * Female receptionist settings:
+     *
+     * Slightly higher pitch
+     * Slightly slower delivery
+     * Full volume
+     */
+
+    utterance.rate = 0.92;
+    utterance.pitch = 1.12;
     utterance.volume = 1;
 
     utterance.onstart = () => {
@@ -232,6 +321,10 @@ function App() {
 
     window.speechSynthesis.speak(utterance);
   };
+
+  // ============================================================
+  // MICROPHONE
+  // ============================================================
 
   const toggleListening = () => {
     if (!voiceSupported) {
@@ -279,6 +372,10 @@ function App() {
       setIsListening(false);
     }
   };
+
+  // ============================================================
+  // SEND MESSAGE
+  // ============================================================
 
   const sendMessage = async (
     messageOverride = null
@@ -389,6 +486,10 @@ function App() {
     }
   };
 
+  // ============================================================
+  // ENTER KEY
+  // ============================================================
+
   const handleKeyDown = (event) => {
     if (
       event.key === "Enter" &&
@@ -398,6 +499,10 @@ function App() {
       sendMessage();
     }
   };
+
+  // ============================================================
+  // RESET
+  // ============================================================
 
   const resetDemo = async () => {
     if (recognitionRef.current) {
@@ -430,7 +535,7 @@ function App() {
       {
         role: "assistant",
         content:
-          "Hey! Welcome to NextFit 👋 How can I help you today?",
+          "Hey, welcome to NextFit 👋 What brings you in today?",
       },
     ]);
 
@@ -452,6 +557,10 @@ function App() {
 
   const profile = lead.profile || {};
 
+  // ============================================================
+  // UI
+  // ============================================================
+
   return (
     <div className="app">
       <header className="topbar">
@@ -462,6 +571,7 @@ function App() {
 
           <div>
             <h1>NextFit</h1>
+
             <span>
               AI Receptionist
             </span>
@@ -480,6 +590,10 @@ function App() {
       </header>
 
       <main className="dashboard">
+        {/* ====================================================
+            CHAT PANEL
+        ==================================================== */}
+
         <section className="chat-panel">
           <div className="chat-header">
             <div>
@@ -615,6 +729,10 @@ function App() {
             )}
           </div>
         </section>
+
+        {/* ====================================================
+            LEAD PANEL
+        ==================================================== */}
 
         <aside className="lead-panel">
           <div className="panel-title">
@@ -819,6 +937,9 @@ function App() {
   );
 }
 
+// ============================================================
+// FORMAT VALUE
+// ============================================================
 
 function formatValue(value) {
   if (
@@ -836,6 +957,9 @@ function formatValue(value) {
   );
 }
 
+// ============================================================
+// LEAD DETAIL
+// ============================================================
 
 function LeadDetail({
   label,
@@ -857,6 +981,9 @@ function LeadDetail({
   );
 }
 
+// ============================================================
+// SIGNAL
+// ============================================================
 
 function Signal({
   label,
@@ -877,6 +1004,5 @@ function Signal({
     </div>
   );
 }
-
 
 export default App;

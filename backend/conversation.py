@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -6,12 +6,17 @@ from .models import LeadProfile
 
 
 class ConversationMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
+    role: Literal[
+        "system",
+        "user",
+        "assistant",
+    ]
+
     content: str
 
 
 class ConversationState(BaseModel):
-    messages: list[ConversationMessage] = Field(
+    messages: List[ConversationMessage] = Field(
         default_factory=list
     )
 

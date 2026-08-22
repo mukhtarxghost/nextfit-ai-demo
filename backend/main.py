@@ -9,10 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from pydantic import BaseModel, ValidationError
 
-from .conversation import (
-    ConversationMessage,
-    ConversationState,
-)
+from .conversation import ConversationMessage, ConversationState
 from .models import LeadProfile
 from .prompts import (
     LEAD_EXTRACTION_PROMPT,
@@ -27,6 +24,10 @@ from .qualification import (
 from .nextfit_config import NEXTFIT_CONFIG
 
 
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
 load_dotenv()
 
 api_key = os.getenv("GROQ_API_KEY")
@@ -39,13 +40,17 @@ if not api_key:
 client = Groq(api_key=api_key)
 
 
+# ============================================================
+# FASTAPI APP
+# ============================================================
+
 app = FastAPI(
     title="Vantix NextFit AI Receptionist",
     description=(
         "Conversational AI receptionist and deterministic "
         "lead qualification system for NextFit."
     ),
-    version="0.4.0",
+    version="0.5.0",
 )
 
 
@@ -61,6 +66,11 @@ app.add_middleware(
 )
 
 
+# ============================================================
+# REQUEST / RESPONSE MODELS
+# ============================================================
+
+
 class ChatRequest(BaseModel):
     message: str
 
@@ -74,7 +84,16 @@ class ChatResponse(BaseModel):
     recommended_action: str
 
 
+# ============================================================
+# GLOBAL CONVERSATION STATE
+# ============================================================
+
 conversation = ConversationState()
+
+
+# ============================================================
+# BUSINESS INFORMATION
+# ============================================================
 
 
 def build_business_info() -> str:
@@ -106,6 +125,107 @@ Business Rules:
     for rule in NEXTFIT_CONFIG["rules"]
 )}
 """
+
+
+# ============================================================
+# CONTACT STATUS
+# ============================================================
+
+
+def build_contact_status() -> str:
+    lead = conversation.lead
+
+    name_status = (
+        "COLLECTED"
+        if lead.name
+        else "MISSING"
+    )
+
+    phone_status = (
+        "COLLECTED"
+        if lead.phone_number
+        else "MISSING"
+    )
+
+    availability_status = (
+        "COLLECTED"
+        if lead.availability
+        else "MISSING"
+    )
+
+    qualification_ready = (
+        is_fully_qualified(lead)
+        and lead.next_step_intent
+        in {"accepted", "interested"}
+    )
+
+    if not qualification_ready:
+        next_contact_step = (
+            "Do not collect contact details yet. "
+            "Continue natural qualification."
+        )
+
+    elif not lead.name:
+        next_contact_step = (
+            "The customer has indicated willingness to continue. "
+            "Ask for their name."
+        )
+
+    elif not lead.phone_number:
+        next_contact_step = (
+            "Name is collected. Ask for the best phone number."
+        )
+
+    elif not lead.availability:
+        next_contact_step = (
+            "Name and phone are collected. Ask what time of day "
+            "usually works best."
+        )
+
+    else:
+        next_contact_step = (
+            "Contact details are complete. Do not ask another "
+            "contact question."
+        )
+
+    return f"""
+============================================================
+CONTACT / HANDOFF STATUS
+============================================================
+
+NAME:
+{name_status}
+
+PHONE NUMBER:
+{phone_status}
+
+AVAILABILITY:
+{availability_status}
+
+QUALIFIED + WILLING TO CONTINUE:
+{"YES" if qualification_ready else "NO"}
+
+NEXT CONTACT STEP:
+{next_contact_step}
+
+IMPORTANT:
+
+Never invent contact information.
+
+Never repeat a contact question if the information is already collected.
+
+Ask only ONE contact question at a time.
+
+Do not collect name or phone number before genuine willingness
+to continue with the NextFit team.
+
+Do not claim a booking or notification occurred.
+"""
+
+
+# ============================================================
+# QUALIFICATION STATUS
+# ============================================================
 
 
 def build_qualification_status() -> str:
@@ -180,6 +300,11 @@ Do not initiate human handoff before core qualification is complete.
 """
 
 
+# ============================================================
+# COMPLETE SYSTEM PROMPT
+# ============================================================
+
+
 def build_system_prompt() -> str:
     return (
         NEXTFIT_SYSTEM_PROMPT
@@ -187,7 +312,14 @@ def build_system_prompt() -> str:
         + build_business_info()
         + "\n\n"
         + build_qualification_status()
+        + "\n\n"
+        + build_contact_status()
     )
+
+
+# ============================================================
+# JSON CLEANING
+# ============================================================
 
 
 def clean_json_response(text: str) -> str:
@@ -213,12 +345,18 @@ def clean_json_response(text: str) -> str:
     if (
         first_brace != -1
         and last_brace != -1
+        and last_brace >= first_brace
     ):
         text = text[
             first_brace:last_brace + 1
         ]
 
     return text.strip()
+
+
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
 
 
 def _normalize_text(value: Any) -> Any:
@@ -243,6 +381,69 @@ def _normalize_text(value: Any) -> Any:
     return value
 
 
+# ============================================================
+# PHONE NORMALIZATION
+# ============================================================
+
+
+def normalize_phone_number(
+    value: Any,
+) -> str | None:
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    if not value:
+        return None
+
+    # Remove common formatting characters.
+    cleaned = re.sub(
+        r"[^\d+]",
+        "",
+        value,
+    )
+
+    if not cleaned:
+        return None
+
+    # Indian numbers:
+    #
+    # 9876543210
+    # +919876543210
+    # 919876543210
+    #
+    digits = re.sub(
+        r"\D",
+        "",
+        cleaned,
+    )
+
+    if len(digits) == 10:
+        return digits
+
+    if (
+        len(digits) == 12
+        and digits.startswith("91")
+    ):
+        return "+" + digits
+
+    # Keep other explicitly provided numbers rather than
+    # destroying potentially valid international numbers.
+    if len(digits) >= 7:
+        if cleaned.startswith("+"):
+            return "+" + digits
+
+        return digits
+
+    return None
+
+
+# ============================================================
+# CONVERSATION TRANSCRIPT
+# ============================================================
+
+
 def _conversation_text() -> str:
     return "\n".join(
         f"{message.role.upper()}: {message.content}"
@@ -250,13 +451,21 @@ def _conversation_text() -> str:
     )
 
 
-def _has_phrase(text: str, phrases: list[str]) -> bool:
+def _has_phrase(
+    text: str,
+    phrases: list[str],
+) -> bool:
     text = text.lower()
 
     return any(
-        phrase in text
+        phrase.lower() in text
         for phrase in phrases
     )
+
+
+# ============================================================
+# EXPERIENCE INFERENCE
+# ============================================================
 
 
 def infer_experience_from_conversation(
@@ -265,6 +474,7 @@ def infer_experience_from_conversation(
 
     text = transcript.lower()
 
+    # Beginner
     if _has_phrase(
         text,
         [
@@ -274,10 +484,12 @@ def infer_experience_from_conversation(
             "never worked out",
             "i'm a beginner",
             "i am a beginner",
+            "im a beginner",
         ],
     ):
         return "beginner"
 
+    # Returning
     if _has_phrase(
         text,
         [
@@ -287,10 +499,12 @@ def infer_experience_from_conversation(
             "started training again",
             "starting again",
             "returning to training",
+            "getting back into the gym",
         ],
     ):
         return "returning"
 
+    # Currently training
     if _has_phrase(
         text,
         [
@@ -306,12 +520,31 @@ def infer_experience_from_conversation(
             "training regularly",
             "work out regularly",
             "workout regularly",
+            "i've been training",
+            "i have been training",
         ],
     ):
+        if re.search(
+            r"\b(?:2|3|4|5|6|7|8|9|1[0-9])\s*(?:\+)?\s*years?\b",
+            text,
+        ):
+            if _has_phrase(
+                text,
+                [
+                    "training",
+                    "workout",
+                    "gym",
+                    "lifting",
+                    "fitness",
+                ],
+            ):
+                return "experienced"
+
         return "currently_training"
 
+    # Experienced
     if re.search(
-        r"\b(?:[2-9]|1[0-9])\s*(?:\+)?\s*years?\b",
+        r"\b(?:2|3|4|5|6|7|8|9|1[0-9])\s*(?:\+)?\s*years?\b",
         text,
     ):
         if _has_phrase(
@@ -329,13 +562,17 @@ def infer_experience_from_conversation(
     return None
 
 
+# ============================================================
+# TIMELINE INFERENCE
+# ============================================================
+
+
 def infer_timeline_from_conversation(
     transcript: str,
 ) -> str | None:
 
     text = transcript.lower()
 
-    # Promotional/event dates are NOT joining intent.
     promotional_context = _has_phrase(
         text,
         [
@@ -367,12 +604,21 @@ def infer_timeline_from_conversation(
             "join tomorrow",
             "start next week",
             "join next week",
+            "want to begin",
+            "looking to join",
+            "ready to join",
+            "ready to start",
+            "i want to join",
+            "i wanna join",
+            "i want to start",
+            "i wanna start",
         ],
     )
 
     if promotional_context and not joining_context:
         return None
 
+    # Immediate
     if _has_phrase(
         text,
         [
@@ -380,10 +626,12 @@ def infer_timeline_from_conversation(
             "today",
             "immediately",
             "as soon as possible",
+            "asap",
         ],
-    ):
+    ) and joining_context:
         return "immediate"
 
+    # Within 7 days
     if _has_phrase(
         text,
         [
@@ -391,10 +639,12 @@ def infer_timeline_from_conversation(
             "within a week",
             "within 7 days",
             "next few days",
+            "in a few days",
         ],
-    ):
+    ) and joining_context:
         return "within_7_days"
 
+    # Within 30 days
     if _has_phrase(
         text,
         [
@@ -403,9 +653,10 @@ def infer_timeline_from_conversation(
             "within 30 days",
             "next month",
         ],
-    ):
+    ) and joining_context:
         return "within_30_days"
 
+    # Researching
     if _has_phrase(
         text,
         [
@@ -413,21 +664,29 @@ def infer_timeline_from_conversation(
             "just exploring",
             "researching",
             "only researching",
+            "just checking",
+            "looking around",
         ],
     ):
         return "researching"
 
+    # Later
     if _has_phrase(
         text,
         [
-            "later",
-            "not yet",
             "maybe later",
+            "not yet",
+            "later on",
         ],
     ):
         return "later"
 
     return None
+
+
+# ============================================================
+# NORMALIZE EXTRACTED LEAD
+# ============================================================
 
 
 def normalize_lead_data(
@@ -452,12 +711,19 @@ def normalize_lead_data(
             data.get(field)
         )
 
+    # Phone
+    data["phone_number"] = normalize_phone_number(
+        data.get("phone_number")
+    )
+
     # ========================================================
     # EXPERIENCE
     # ========================================================
 
-    inferred_experience = infer_experience_from_conversation(
-        transcript
+    inferred_experience = (
+        infer_experience_from_conversation(
+            transcript
+        )
     )
 
     if inferred_experience:
@@ -468,9 +734,7 @@ def normalize_lead_data(
         if raw is None:
             data["experience"] = "unknown"
         else:
-            value = str(
-                raw
-            ).lower().strip()
+            value = str(raw).lower().strip()
 
             if value not in {
                 "beginner",
@@ -487,8 +751,10 @@ def normalize_lead_data(
     # TIMELINE
     # ========================================================
 
-    inferred_timeline = infer_timeline_from_conversation(
-        transcript
+    inferred_timeline = (
+        infer_timeline_from_conversation(
+            transcript
+        )
     )
 
     if inferred_timeline:
@@ -499,9 +765,7 @@ def normalize_lead_data(
         if raw is None:
             data["timeline"] = "unknown"
         else:
-            value = str(
-                raw
-            ).lower().strip()
+            value = str(raw).lower().strip()
 
             if value not in {
                 "immediate",
@@ -519,24 +783,23 @@ def normalize_lead_data(
     # TRAINING PREFERENCE
     # ========================================================
 
-    raw = data.get(
-        "training_preference"
-    )
+    raw = data.get("training_preference")
 
     if raw is None:
         data["training_preference"] = "unknown"
     else:
-        value = str(
-            raw
-        ).lower().strip()
+        value = str(raw).lower().strip()
 
-        if value not in {
+        allowed = {
             "membership",
             "personal_training",
             "hybrid",
             "trial",
             "unknown",
-        }:
+        }
+
+        if value not in allowed:
+
             if _has_phrase(
                 value,
                 [
@@ -547,7 +810,6 @@ def normalize_lead_data(
                     "trainer",
                     "hands-on guidance",
                     "guided training",
-                    "accountability",
                 ],
             ):
                 data["training_preference"] = (
@@ -570,27 +832,26 @@ def normalize_lead_data(
             data["training_preference"] = value
 
     # ========================================================
-    # NEXT STEP
+    # NEXT STEP INTENT
     # ========================================================
 
-    raw = data.get(
-        "next_step_intent"
-    )
+    raw = data.get("next_step_intent")
 
     if raw is None:
         data["next_step_intent"] = "unknown"
     else:
-        value = str(
-            raw
-        ).lower().strip()
+        value = str(raw).lower().strip()
 
-        if value not in {
+        allowed = {
             "accepted",
             "interested",
             "maybe",
             "declined",
             "unknown",
-        }:
+        }
+
+        if value not in allowed:
+
             if _has_phrase(
                 value,
                 [
@@ -599,6 +860,9 @@ def normalize_lead_data(
                     "definitely",
                     "happy to",
                     "yes",
+                    "okay",
+                    "ok",
+                    "sure",
                 ],
             ):
                 data["next_step_intent"] = "accepted"
@@ -630,6 +894,7 @@ def normalize_lead_data(
 
             else:
                 data["next_step_intent"] = "unknown"
+
         else:
             data["next_step_intent"] = value
 
@@ -642,15 +907,11 @@ def normalize_lead_data(
         "program_fit",
         "goal_clarity",
     ]:
-        value = data.get(
-            field,
-            0,
-        )
+
+        value = data.get(field, 0)
 
         try:
-            value = int(
-                float(value)
-            )
+            value = int(float(value))
         except (
             TypeError,
             ValueError,
@@ -659,24 +920,22 @@ def normalize_lead_data(
 
         data[field] = max(
             0,
-            min(
-                10,
-                value,
-            ),
+            min(10, value),
         )
 
     # ========================================================
-    # HUMAN
+    # HUMAN HANDOFF
     # ========================================================
 
-    data["needs_human"] = bool(
-        data.get(
-            "needs_human",
-            False,
-        )
-    )
+    # Never allow the LLM to directly trigger handoff.
+    data["needs_human"] = False
 
     return data
+
+
+# ============================================================
+# MERGE LEAD DATA
+# ============================================================
 
 
 def merge_lead_data(
@@ -688,6 +947,7 @@ def merge_lead_data(
 
     text_fields = [
         "name",
+        "phone_number",
         "intent",
         "goal",
         "current_situation",
@@ -699,6 +959,7 @@ def merge_lead_data(
     ]
 
     for field in text_fields:
+
         value = extracted.get(field)
 
         if value:
@@ -712,6 +973,7 @@ def merge_lead_data(
     ]
 
     for field in categorical_fields:
+
         value = extracted.get(field)
 
         if value and value != "unknown":
@@ -722,18 +984,21 @@ def merge_lead_data(
         "program_fit",
         "goal_clarity",
     ]:
+
         value = extracted.get(field)
 
         if value is not None:
             current[field] = value
 
-    # needs_human is NOT allowed to determine final handoff.
-    # Final handoff is decided deterministically later.
+    # Deterministic handoff only.
     current["needs_human"] = False
 
-    return LeadProfile(
-        **current
-    )
+    return LeadProfile(**current)
+
+
+# ============================================================
+# LEAD EXTRACTION
+# ============================================================
 
 
 def extract_lead_information() -> LeadProfile:
@@ -760,6 +1025,7 @@ CONVERSATION:
 """
 
     try:
+
         completion = client.chat.completions.create(
             model="qwen/qwen3.6-27b",
             messages=[
@@ -776,7 +1042,7 @@ CONVERSATION:
                 },
             ],
             temperature=0.1,
-            max_tokens=1000,
+            max_tokens=1200,
             reasoning_effort="none",
             reasoning_format="hidden",
         )
@@ -793,9 +1059,7 @@ CONVERSATION:
             raw_content
         )
 
-        extracted_data = json.loads(
-            cleaned
-        )
+        extracted_data = json.loads(cleaned)
 
         extracted_data = normalize_lead_data(
             extracted_data,
@@ -810,9 +1074,9 @@ CONVERSATION:
         conversation.lead = new_lead
 
         print()
-        print("=" * 50)
+        print("=" * 60)
         print("LEAD UPDATED")
-        print("=" * 50)
+        print("=" * 60)
         print(
             json.dumps(
                 new_lead.model_dump(),
@@ -820,49 +1084,111 @@ CONVERSATION:
                 default=str,
             )
         )
-        print("=" * 50)
+        print("=" * 60)
         print()
 
         return new_lead
 
     except json.JSONDecodeError as error:
+
         print(
             "LEAD JSON ERROR:",
             repr(error),
         )
+
         return conversation.lead
 
     except ValidationError as error:
+
         print(
             "LEAD VALIDATION ERROR:",
             error,
         )
+
         return conversation.lead
 
     except Exception as error:
+
         print(
             "LEAD EXTRACTION ERROR:",
             type(error).__name__,
             str(error),
         )
+
         return conversation.lead
+
+
+# ============================================================
+# CONTACT COMPLETION
+# ============================================================
+
+
+def contact_details_complete(
+    lead: LeadProfile,
+) -> bool:
+    return bool(
+        lead.name
+        and lead.phone_number
+        and lead.availability
+    )
+
+
+def handoff_eligible(
+    lead: LeadProfile,
+    score: int,
+) -> bool:
+    return (
+        is_fully_qualified(lead)
+        and lead.next_step_intent
+        in {
+            "accepted",
+            "interested",
+        }
+        and score >= 65
+    )
+
+
+# ============================================================
+# ROOT
+# ============================================================
 
 
 @app.get("/")
 def root():
+
     return {
         "status": "online",
         "service": "Vantix NextFit AI Receptionist",
-        "version": "0.4.0",
+        "version": "0.5.0",
     }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 
 @app.get("/health")
 def health():
+
     return {
         "status": "healthy",
         "conversation_turns": conversation.turn_count,
+        "handoff_eligible": handoff_eligible(
+            conversation.lead,
+            calculate_qualification(
+                conversation.lead
+            ).score,
+        ),
+        "contact_details_complete": contact_details_complete(
+            conversation.lead
+        ),
     }
+
+
+# ============================================================
+# CHAT
+# ============================================================
 
 
 @app.post(
@@ -878,10 +1204,15 @@ def chat(
     user_message = request.message.strip()
 
     if not user_message:
+
         raise HTTPException(
             status_code=400,
             detail="Message cannot be empty.",
         )
+
+    # --------------------------------------------------------
+    # Add user message
+    # --------------------------------------------------------
 
     conversation.messages.append(
         ConversationMessage(
@@ -892,9 +1223,15 @@ def chat(
 
     conversation.turn_count += 1
 
-    # Extract user information BEFORE AI response
-    # so the AI knows what is already known.
+    # --------------------------------------------------------
+    # Extract BEFORE AI response
+    # --------------------------------------------------------
+
     lead = extract_lead_information()
+
+    # --------------------------------------------------------
+    # Build conversation messages
+    # --------------------------------------------------------
 
     messages = [
         {
@@ -904,6 +1241,7 @@ def chat(
     ]
 
     for message in conversation.messages:
+
         messages.append(
             {
                 "role": message.role,
@@ -911,7 +1249,12 @@ def chat(
             }
         )
 
+    # --------------------------------------------------------
+    # Generate AI response
+    # --------------------------------------------------------
+
     try:
+
         completion = client.chat.completions.create(
             model="qwen/qwen3.6-27b",
             messages=messages,
@@ -931,6 +1274,7 @@ def chat(
 
     except Exception as error:
 
+        # Roll back failed user turn.
         conversation.messages.pop()
 
         conversation.turn_count = max(
@@ -949,6 +1293,10 @@ def chat(
             detail="AI service temporarily unavailable.",
         )
 
+    # --------------------------------------------------------
+    # Add assistant response
+    # --------------------------------------------------------
+
     conversation.messages.append(
         ConversationMessage(
             role="assistant",
@@ -956,36 +1304,59 @@ def chat(
         )
     )
 
-    # Extract again after assistant response so the
-    # persistent profile is refreshed from the full transcript.
+    # --------------------------------------------------------
+    # Extract again from full transcript
+    # --------------------------------------------------------
+
     lead = extract_lead_information()
+
+    # --------------------------------------------------------
+    # Deterministic qualification
+    # --------------------------------------------------------
 
     result = calculate_qualification(
         lead
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # DETERMINISTIC HANDOFF
-    # ========================================================
+    #
+    # Stage 1:
+    # Qualification + genuine interest
+    #
+    # Stage 2:
+    # Contact details
+    #
+    # Only Stage 2 is considered complete handoff.
+    # --------------------------------------------------------
 
-    conversation.handoff_required = (
-        is_fully_qualified(lead)
-        and lead.next_step_intent
-        in {
-            "accepted",
-            "interested",
-        }
-        and result.score >= 65
+    qualification_ready = handoff_eligible(
+        lead,
+        result.score,
     )
 
-    # Only expose handoff once deterministic conditions are met.
-    lead.needs_human = conversation.handoff_required
+    contact_complete = contact_details_complete(
+        lead
+    )
+
+    conversation.handoff_required = (
+        qualification_ready
+        and contact_complete
+    )
+
+    lead.needs_human = (
+        conversation.handoff_required
+    )
 
     conversation.lead = lead
 
     conversation.conversation_complete = (
         conversation.handoff_required
     )
+
+    # --------------------------------------------------------
+    # Return response
+    # --------------------------------------------------------
 
     return ChatResponse(
         response=response_text,
@@ -995,6 +1366,11 @@ def chat(
         reasons=result.reasons,
         recommended_action=result.recommended_action,
     )
+
+
+# ============================================================
+# RESET
+# ============================================================
 
 
 @app.post("/reset")
