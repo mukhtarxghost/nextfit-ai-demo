@@ -1,135 +1,203 @@
 from .models import LeadProfile, QualificationResult
 
 
+def _has_text(value: str | None) -> bool:
+    return bool(
+        value
+        and value.strip()
+        and value.strip().lower()
+        not in {
+            "unknown",
+            "none",
+            "null",
+            "n/a",
+            "na",
+            "-",
+        }
+    )
+
+
+def get_qualification_status(
+    lead: LeadProfile,
+) -> dict[str, bool]:
+    return {
+        "goal": _has_text(lead.goal),
+        "current_situation": _has_text(
+            lead.current_situation
+        ),
+        "experience": lead.experience != "unknown",
+        "problem": _has_text(lead.problem),
+        "previous_attempts": _has_text(
+            lead.previous_attempts
+        ),
+        "support_need": (
+            lead.training_preference != "unknown"
+            or _has_text(lead.desired_outcome)
+        ),
+        "location": _has_text(lead.location),
+        "timeline": lead.timeline != "unknown",
+        "availability": _has_text(
+            lead.availability
+        ),
+    }
+
+
+def get_missing_qualification_fields(
+    lead: LeadProfile,
+) -> list[str]:
+    status = get_qualification_status(lead)
+
+    ordered_fields = [
+        "goal",
+        "current_situation",
+        "experience",
+        "problem",
+        "previous_attempts",
+        "support_need",
+        "location",
+        "timeline",
+        "availability",
+    ]
+
+    return [
+        field
+        for field in ordered_fields
+        if not status[field]
+    ]
+
+
+def is_fully_qualified(
+    lead: LeadProfile,
+) -> bool:
+    status = get_qualification_status(lead)
+
+    core_fields = [
+        "goal",
+        "current_situation",
+        "problem",
+        "support_need",
+        "location",
+        "timeline",
+        "availability",
+    ]
+
+    return all(
+        status[field]
+        for field in core_fields
+    )
+
+
 def calculate_qualification(
     lead: LeadProfile,
 ) -> QualificationResult:
-    """
-    Deterministic qualification engine for NextFit.
-
-    The AI extracts information.
-    This function decides how strong the lead is.
-    """
 
     score = 0
-    reasons = []
+    reasons: list[str] = []
 
-    # ==================================================
-    # 1. INTENT / NEED — 20 POINTS
-    # ==================================================
+    status = get_qualification_status(lead)
+
+    # ========================================================
+    # 1. SERVICE INTENT — 15
+    # ========================================================
+
+    preference = (
+        lead.training_preference
+        or ""
+    ).lower().strip()
 
     intent = (
-        lead.intent or ""
+        lead.intent
+        or ""
     ).lower().strip()
 
-    training_preference = (
-        lead.training_preference or ""
-    ).lower().strip()
-
-    strong_intent = (
-        "personal" in intent
-        or "personal" in training_preference
-        or intent in {
-            "pt",
-            "fitness studio",
-            "fitness_studio",
-        }
-    )
-
-    good_intent = (
-        "membership" in intent
-        or "trial" in intent
-        or "hybrid" in intent
-        or training_preference in {
-            "membership",
-            "trial",
-            "hybrid",
-        }
-    )
-
-    if strong_intent:
-
-        score += 20
-
+    if preference == "personal_training":
+        score += 15
         reasons.append(
-            "Clear requirement for a higher-support fitness service."
+            "The caller appears to need higher-support guidance."
         )
 
-    elif good_intent:
-
-        score += 15
-
+    elif preference in {
+        "hybrid",
+        "trial",
+    }:
+        score += 12
         reasons.append(
-            "Clear interest in a NextFit service."
+            "The caller has expressed interest in a guided NextFit service."
+        )
+
+    elif preference == "membership":
+        score += 8
+        reasons.append(
+            "The caller has expressed interest in a gym membership."
         )
 
     elif intent:
-
-        score += 8
-
+        score += 5
         reasons.append(
-            "The caller has expressed a fitness-related requirement."
+            "The caller has expressed a clear fitness-related need."
         )
 
-    elif training_preference != "unknown":
-
-        score += 8
-
-        reasons.append(
-            "The caller has expressed interest in a NextFit service."
-        )
-
-    # ==================================================
-    # 2. GOAL CLARITY — 15 POINTS
-    # ==================================================
+    # ========================================================
+    # 2. GOAL CLARITY — 15
+    # ========================================================
 
     if lead.goal_clarity >= 8:
-
         score += 15
-
         reasons.append(
             "The caller has a clear and specific fitness goal."
         )
 
     elif lead.goal_clarity >= 5:
-
         score += 10
-
         reasons.append(
             "The caller has a reasonably defined fitness goal."
         )
 
     elif lead.goal_clarity > 0:
-
         score += 5
 
-    # ==================================================
-    # 3. PROGRAM FIT — 15 POINTS
-    # ==================================================
+    # ========================================================
+    # 3. PROBLEM — 15
+    # ========================================================
+
+    if status["problem"]:
+        score += 15
+        reasons.append(
+            "The caller has identified a specific obstacle or frustration."
+        )
+
+    # ========================================================
+    # 4. PREVIOUS ATTEMPTS — 10
+    # ========================================================
+
+    if status["previous_attempts"]:
+        score += 10
+        reasons.append(
+            "The caller has shared previous attempts to solve the problem."
+        )
+
+    # ========================================================
+    # 5. PROGRAM FIT — 10
+    # ========================================================
 
     if lead.program_fit >= 8:
-
-        score += 15
-
+        score += 10
         reasons.append(
-            "The caller's requirements strongly match the service."
+            "The caller's needs strongly match NextFit's services."
         )
 
     elif lead.program_fit >= 5:
-
-        score += 10
-
+        score += 7
         reasons.append(
-            "The caller appears to be a reasonable fit."
+            "The caller appears to be a reasonable fit for NextFit."
         )
 
     elif lead.program_fit > 0:
+        score += 4
 
-        score += 5
-
-    # ==================================================
-    # 4. READINESS / TIMELINE — 15 POINTS
-    # ==================================================
+    # ========================================================
+    # 6. TIMELINE — 15
+    # ========================================================
 
     timeline_scores = {
         "immediate": 15,
@@ -148,48 +216,42 @@ def calculate_qualification(
     score += timeline_score
 
     if timeline_score >= 15:
-
         reasons.append(
             "The caller is ready to take action soon."
         )
 
     elif timeline_score >= 10:
-
         reasons.append(
-            "The caller is considering starting within the near future."
+            "The caller is considering starting in the near future."
         )
 
-    elif lead.timeline == "researching":
+    # ========================================================
+    # 7. ENGAGEMENT — 10
+    # ========================================================
 
-        reasons.append(
-            "The caller appears to be researching rather than ready to act."
-        )
-
-    # ==================================================
-    # 5. ENGAGEMENT — 10 POINTS
-    # ==================================================
-
-    engagement_score = round(
-        lead.engagement
+    engagement_score = max(
+        0,
+        min(
+            10,
+            round(lead.engagement),
+        ),
     )
 
     score += engagement_score
 
     if engagement_score >= 8:
-
         reasons.append(
-            "The caller is highly engaged in the conversation."
+            "The caller is highly engaged."
         )
 
     elif engagement_score >= 5:
-
         reasons.append(
             "The caller is reasonably engaged."
         )
 
-    # ==================================================
-    # 6. EXPERIENCE / CONTEXT — 5 POINTS
-    # ==================================================
+    # ========================================================
+    # 8. EXPERIENCE — 5
+    # ========================================================
 
     experience_scores = {
         "experienced": 5,
@@ -199,101 +261,127 @@ def calculate_qualification(
         "unknown": 0,
     }
 
-    experience_score = experience_scores.get(
+    score += experience_scores.get(
         lead.experience,
         0,
     )
 
-    score += experience_score
+    # ========================================================
+    # 9. LOCATION — 5
+    # ========================================================
 
-    # ==================================================
-    # 7. NEXT STEP WILLINGNESS — 10 POINTS
-    # ==================================================
+    if status["location"]:
+        score += 5
+        reasons.append(
+            "The caller's location has been established."
+        )
+
+    # ========================================================
+    # 10. AVAILABILITY — 5
+    # ========================================================
+
+    if status["availability"]:
+        score += 5
+        reasons.append(
+            "The caller's availability has been established."
+        )
+
+    # ========================================================
+    # 11. NEXT STEP — 5
+    # ========================================================
 
     next_step_scores = {
-        "accepted": 10,
-        "interested": 7,
-        "maybe": 4,
+        "accepted": 5,
+        "interested": 3,
+        "maybe": 1,
         "declined": 0,
         "unknown": 0,
     }
 
-    next_step_score = next_step_scores.get(
+    score += next_step_scores.get(
         lead.next_step_intent,
         0,
     )
 
-    score += next_step_score
-
     if lead.next_step_intent == "accepted":
-
         reasons.append(
-            "The caller agreed to speak with the NextFit team."
+            "The caller agreed to continue with the NextFit team."
         )
 
     elif lead.next_step_intent == "interested":
-
         reasons.append(
-            "The caller showed interest in taking the next step."
+            "The caller showed interest in continuing."
         )
 
-    # ==================================================
-    # 8. HUMAN HANDOFF
-    # ==================================================
+    # ========================================================
+    # QUALIFICATION GATE
+    # ========================================================
 
-    if lead.needs_human:
+    fully_qualified = is_fully_qualified(lead)
 
-        reasons.append(
-            "Human follow-up is recommended for this conversation."
-        )
-
-    # ==================================================
-    # FINAL CLASSIFICATION
-    # ==================================================
-
-    score = min(
-        score,
-        100,
+    missing_fields = get_missing_qualification_fields(
+        lead
     )
 
-    if score >= 85:
+    valid_handoff = (
+        fully_qualified
+        and lead.next_step_intent
+        in {
+            "accepted",
+            "interested",
+        }
+    )
 
+    if valid_handoff:
+        reasons.append(
+            "The lead has completed core qualification and indicated willingness to continue."
+        )
+
+    score = min(score, 100)
+
+    # ========================================================
+    # CLASSIFICATION
+    # ========================================================
+
+    if valid_handoff and score >= 80:
         classification = "HOT"
 
         recommended_action = (
-            "Prioritize for human follow-up and offer "
-            "a 15–20 minute consultation."
+            "Lead is fully qualified and has agreed to continue. "
+            "Prioritize human follow-up."
         )
 
-    elif score >= 70:
-
+    elif fully_qualified and score >= 65:
         classification = "QUALIFIED"
 
         recommended_action = (
-            "Follow up with the lead and assess "
-            "availability for a consultation."
+            "Lead has completed core qualification. "
+            "Confirm interest and move toward the appropriate NextFit next step."
         )
 
-    elif score >= 50:
-
+    elif score >= 45:
         classification = "NURTURE"
 
         recommended_action = (
-            "Keep the lead in follow-up and provide "
-            "relevant information."
+            "Continue the conversation and naturally collect the remaining "
+            "qualification information."
         )
 
-    elif score >= 30:
-
+    elif score >= 20:
         classification = "INFORMATION"
 
-        recommended_action = (
-            "The caller appears to be mainly gathering "
-            "information. No priority follow-up required."
-        )
+        if missing_fields:
+            recommended_action = (
+                "Continue naturally. Remaining qualification: "
+                + ", ".join(missing_fields)
+                + "."
+            )
+        else:
+            recommended_action = (
+                "The caller is engaged but not yet ready for priority follow-up."
+            )
 
     else:
-
         classification = "LOW"
 
         recommended_action = (

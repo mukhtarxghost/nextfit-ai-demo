@@ -9,16 +9,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from pydantic import BaseModel, ValidationError
 
-from .conversation import ConversationState, ConversationMessage
+from .conversation import (
+    ConversationMessage,
+    ConversationState,
+)
 from .models import LeadProfile
-from .prompts import NEXTFIT_SYSTEM_PROMPT, LEAD_EXTRACTION_PROMPT
-from .qualification import calculate_qualification
+from .prompts import (
+    LEAD_EXTRACTION_PROMPT,
+    NEXTFIT_SYSTEM_PROMPT,
+)
+from .qualification import (
+    calculate_qualification,
+    get_missing_qualification_fields,
+    get_qualification_status,
+    is_fully_qualified,
+)
 from .nextfit_config import NEXTFIT_CONFIG
 
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
 
 load_dotenv()
 
@@ -32,21 +39,15 @@ if not api_key:
 client = Groq(api_key=api_key)
 
 
-# ============================================================
-# FASTAPI APP
-# ============================================================
-
 app = FastAPI(
     title="Vantix NextFit AI Receptionist",
     description=(
-        "Conversational AI receptionist and lead qualification "
-        "system for NextFit."
+        "Conversational AI receptionist and deterministic "
+        "lead qualification system for NextFit."
     ),
-    version="0.2.0",
+    version="0.4.0",
 )
-# ============================================================
-# CORS
-# ============================================================
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,9 +59,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ============================================================
-# REQUEST / RESPONSE MODELS
-# ============================================================
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -75,53 +74,125 @@ class ChatResponse(BaseModel):
     recommended_action: str
 
 
-# ============================================================
-# CONVERSATION STATE
-# ============================================================
-
 conversation = ConversationState()
 
 
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
+def build_business_info() -> str:
+    services = ", ".join(
+        NEXTFIT_CONFIG["services"]
+    )
 
-def build_system_prompt() -> str:
-    business_info = f"""
+    return f"""
 BUSINESS CONFIGURATION
 
 Business:
 {NEXTFIT_CONFIG["business_name"]}
 
-Location:
+Primary Location:
 {NEXTFIT_CONFIG["location"]}
 
 Services:
-{", ".join(NEXTFIT_CONFIG["services"])}
+{services}
 
 Known Information:
-{NEXTFIT_CONFIG["known_information"]}
+{json.dumps(
+    NEXTFIT_CONFIG["known_information"],
+    indent=2,
+)}
 
-Rules:
-{NEXTFIT_CONFIG["rules"]}
+Business Rules:
+{chr(10).join(
+    "- " + rule
+    for rule in NEXTFIT_CONFIG["rules"]
+)}
 """
 
-    return NEXTFIT_SYSTEM_PROMPT + "\n\n" + business_info
+
+def build_qualification_status() -> str:
+    lead = conversation.lead
+
+    status = get_qualification_status(lead)
+
+    labels = {
+        "goal": "Goal",
+        "current_situation": "Current situation",
+        "experience": "Experience",
+        "problem": "Main problem",
+        "previous_attempts": "Previous attempts",
+        "support_need": "Support/service need",
+        "location": "Location",
+        "timeline": "Joining timeline",
+        "availability": "Availability",
+    }
+
+    lines = []
+
+    for field, collected in status.items():
+        state = (
+            "COLLECTED"
+            if collected
+            else "MISSING"
+        )
+
+        lines.append(
+            f"{labels[field]}: {state}"
+        )
+
+    missing = get_missing_qualification_fields(
+        lead
+    )
+
+    next_priority = (
+        missing[0]
+        if missing
+        else "none — core qualification complete"
+    )
+
+    return f"""
+============================================================
+QUALIFICATION STATUS
+============================================================
+
+{chr(10).join(lines)}
+
+NEXT PRIORITY:
+{next_priority}
+
+CORE QUALIFICATION COMPLETE:
+{"YES" if is_fully_qualified(lead) else "NO"}
+
+CURRENT NEXT-STEP INTENT:
+{lead.next_step_intent}
+
+IMPORTANT:
+
+Use this information internally.
+
+Do not mention qualification fields to the customer.
+
+Ask only ONE useful question.
+
+Do not make the conversation sound like a checklist.
+
+Do not ask for information already collected.
+
+Do not initiate human handoff before core qualification is complete.
+"""
 
 
-# ============================================================
-# JSON HELPERS
-# ============================================================
+def build_system_prompt() -> str:
+    return (
+        NEXTFIT_SYSTEM_PROMPT
+        + "\n\n"
+        + build_business_info()
+        + "\n\n"
+        + build_qualification_status()
+    )
+
 
 def clean_json_response(text: str) -> str:
-    """
-    Remove markdown code fences and surrounding junk from
-    model-generated JSON.
-    """
-
     text = text.strip()
 
-    # Remove ```json ... ``` blocks
     if text.startswith("```"):
         text = re.sub(
             r"^```(?:json)?\s*",
@@ -136,31 +207,233 @@ def clean_json_response(text: str) -> str:
             text,
         )
 
-    # Find the first JSON object if the model added commentary
     first_brace = text.find("{")
     last_brace = text.rfind("}")
 
-    if first_brace != -1 and last_brace != -1:
-        text = text[first_brace:last_brace + 1]
+    if (
+        first_brace != -1
+        and last_brace != -1
+    ):
+        text = text[
+            first_brace:last_brace + 1
+        ]
 
     return text.strip()
 
 
-# ============================================================
-# LEAD NORMALIZATION
-# ============================================================
+def _normalize_text(value: Any) -> Any:
+    if value is None:
+        return None
 
-def normalize_lead_data(data: dict[str, Any]) -> dict[str, Any]:
-    """
-    Groq is intentionally allowed to return natural language.
+    value = str(value).strip()
 
-    This function converts that flexible output into the exact
-    enum values required by LeadProfile.
-    """
+    if not value:
+        return None
 
-    # --------------------------------------------------------
-    # BASIC TEXT FIELDS
-    # --------------------------------------------------------
+    if value.lower() in {
+        "unknown",
+        "none",
+        "null",
+        "n/a",
+        "na",
+        "-",
+    }:
+        return None
+
+    return value
+
+
+def _conversation_text() -> str:
+    return "\n".join(
+        f"{message.role.upper()}: {message.content}"
+        for message in conversation.messages
+    )
+
+
+def _has_phrase(text: str, phrases: list[str]) -> bool:
+    text = text.lower()
+
+    return any(
+        phrase in text
+        for phrase in phrases
+    )
+
+
+def infer_experience_from_conversation(
+    transcript: str,
+) -> str | None:
+
+    text = transcript.lower()
+
+    if _has_phrase(
+        text,
+        [
+            "new to the gym",
+            "new to fitness",
+            "never trained",
+            "never worked out",
+            "i'm a beginner",
+            "i am a beginner",
+        ],
+    ):
+        return "beginner"
+
+    if _has_phrase(
+        text,
+        [
+            "getting back into training",
+            "getting back to training",
+            "coming back to the gym",
+            "started training again",
+            "starting again",
+            "returning to training",
+        ],
+    ):
+        return "returning"
+
+    if _has_phrase(
+        text,
+        [
+            "currently train",
+            "currently training",
+            "currently working out",
+            "i train ",
+            "i work out ",
+            "training five days",
+            "training 5 days",
+            "training six days",
+            "training 6 days",
+            "training regularly",
+            "work out regularly",
+            "workout regularly",
+        ],
+    ):
+        return "currently_training"
+
+    if re.search(
+        r"\b(?:[2-9]|1[0-9])\s*(?:\+)?\s*years?\b",
+        text,
+    ):
+        if _has_phrase(
+            text,
+            [
+                "training",
+                "workout",
+                "gym",
+                "lifting",
+                "fitness",
+            ],
+        ):
+            return "experienced"
+
+    return None
+
+
+def infer_timeline_from_conversation(
+    transcript: str,
+) -> str | None:
+
+    text = transcript.lower()
+
+    # Promotional/event dates are NOT joining intent.
+    promotional_context = _has_phrase(
+        text,
+        [
+            "independence day",
+            "15th august",
+            "15 august",
+            "discount",
+            "discounts",
+            "offer",
+            "offers",
+            "promotion",
+            "promo",
+        ],
+    )
+
+    joining_context = _has_phrase(
+        text,
+        [
+            "want to join",
+            "want to start",
+            "looking to start",
+            "planning to join",
+            "planning to start",
+            "joining this week",
+            "starting this week",
+            "start today",
+            "start tomorrow",
+            "join today",
+            "join tomorrow",
+            "start next week",
+            "join next week",
+        ],
+    )
+
+    if promotional_context and not joining_context:
+        return None
+
+    if _has_phrase(
+        text,
+        [
+            "right now",
+            "today",
+            "immediately",
+            "as soon as possible",
+        ],
+    ):
+        return "immediate"
+
+    if _has_phrase(
+        text,
+        [
+            "this week",
+            "within a week",
+            "within 7 days",
+            "next few days",
+        ],
+    ):
+        return "within_7_days"
+
+    if _has_phrase(
+        text,
+        [
+            "this month",
+            "within a month",
+            "within 30 days",
+            "next month",
+        ],
+    ):
+        return "within_30_days"
+
+    if _has_phrase(
+        text,
+        [
+            "just looking",
+            "just exploring",
+            "researching",
+            "only researching",
+        ],
+    ):
+        return "researching"
+
+    if _has_phrase(
+        text,
+        [
+            "later",
+            "not yet",
+            "maybe later",
+        ],
+    ):
+        return "later"
+
+    return None
+
+
+def normalize_lead_data(
+    data: dict[str, Any],
+    transcript: str,
+) -> dict[str, Any]:
 
     text_fields = [
         "name",
@@ -168,415 +441,318 @@ def normalize_lead_data(data: dict[str, Any]) -> dict[str, Any]:
         "goal",
         "current_situation",
         "problem",
+        "previous_attempts",
         "desired_outcome",
         "location",
         "availability",
     ]
 
     for field in text_fields:
-        value = data.get(field)
+        data[field] = _normalize_text(
+            data.get(field)
+        )
 
-        if value is not None:
-            value = str(value).strip()
-
-            if not value:
-                data[field] = None
-            else:
-                data[field] = value
-
-    # --------------------------------------------------------
+    # ========================================================
     # EXPERIENCE
-    # --------------------------------------------------------
+    # ========================================================
 
-    raw_experience = data.get("experience")
+    inferred_experience = infer_experience_from_conversation(
+        transcript
+    )
 
-    if raw_experience is None:
-        data["experience"] = "unknown"
-
+    if inferred_experience:
+        data["experience"] = inferred_experience
     else:
-        experience = str(raw_experience).lower().strip()
+        raw = data.get("experience")
 
-        if experience in {
-            "beginner",
-            "returning",
-            "currently_training",
-            "experienced",
-            "unknown",
-        }:
-            data["experience"] = experience
-
-        elif any(
-            phrase in experience
-            for phrase in [
-                "two years",
-                "3 years",
-                "three years",
-                "4 years",
-                "four years",
-                "5 years",
-                "five years",
-                "years of training",
-                "years training",
-                "experienced",
-                "advanced",
-            ]
-        ):
-            data["experience"] = "experienced"
-
-        elif any(
-            phrase in experience
-            for phrase in [
-                "currently training",
-                "currently working out",
-                "training regularly",
-                "work out regularly",
-                "workout regularly",
-            ]
-        ):
-            data["experience"] = "currently_training"
-
-        elif any(
-            phrase in experience
-            for phrase in [
-                "returning",
-                "coming back",
-                "started again",
-                "getting back",
-            ]
-        ):
-            data["experience"] = "returning"
-
-        elif any(
-            phrase in experience
-            for phrase in [
-                "beginner",
-                "never trained",
-                "new to training",
-                "new to fitness",
-            ]
-        ):
-            data["experience"] = "beginner"
-
-        else:
+        if raw is None:
             data["experience"] = "unknown"
-
-    # --------------------------------------------------------
-    # TIMELINE
-    # --------------------------------------------------------
-
-    raw_timeline = data.get("timeline")
-
-    if raw_timeline is None:
-        data["timeline"] = "unknown"
-
-    else:
-        timeline = str(raw_timeline).lower().strip()
-
-        if timeline in {
-            "immediate",
-            "within_7_days",
-            "within_30_days",
-            "later",
-            "researching",
-            "unknown",
-        }:
-            data["timeline"] = timeline
-
-        elif any(
-            phrase in timeline
-            for phrase in [
-                "today",
-                "right now",
-                "immediately",
-                "as soon as possible",
-            ]
-        ):
-            data["timeline"] = "immediate"
-
-        elif any(
-            phrase in timeline
-            for phrase in [
-                "this week",
-                "within a week",
-                "within 7 days",
-                "next few days",
-                "next week",
-                "soon",
-            ]
-        ):
-            data["timeline"] = "within_7_days"
-
-        elif any(
-            phrase in timeline
-            for phrase in [
-                "this month",
-                "within a month",
-                "within 30 days",
-                "next month",
-            ]
-        ):
-            data["timeline"] = "within_30_days"
-
-        elif any(
-            phrase in timeline
-            for phrase in [
-                "researching",
-                "just looking",
-                "just exploring",
-                "exploring options",
-            ]
-        ):
-            data["timeline"] = "researching"
-
-        elif "later" in timeline:
-            data["timeline"] = "later"
-
         else:
-            data["timeline"] = "unknown"
+            value = str(
+                raw
+            ).lower().strip()
 
-    # --------------------------------------------------------
-    # TRAINING PREFERENCE
-    # --------------------------------------------------------
+            if value not in {
+                "beginner",
+                "returning",
+                "currently_training",
+                "experienced",
+                "unknown",
+            }:
+                data["experience"] = "unknown"
+            else:
+                data["experience"] = value
 
-    raw_preference = data.get("training_preference")
+    # ========================================================
+    # TIMELINE
+    # ========================================================
 
-    if raw_preference is None:
-        data["training_preference"] = "unknown"
+    inferred_timeline = infer_timeline_from_conversation(
+        transcript
+    )
 
+    if inferred_timeline:
+        data["timeline"] = inferred_timeline
     else:
-        preference = str(raw_preference).lower().strip()
+        raw = data.get("timeline")
 
-        if preference in {
+        if raw is None:
+            data["timeline"] = "unknown"
+        else:
+            value = str(
+                raw
+            ).lower().strip()
+
+            if value not in {
+                "immediate",
+                "within_7_days",
+                "within_30_days",
+                "later",
+                "researching",
+                "unknown",
+            }:
+                data["timeline"] = "unknown"
+            else:
+                data["timeline"] = value
+
+    # ========================================================
+    # TRAINING PREFERENCE
+    # ========================================================
+
+    raw = data.get(
+        "training_preference"
+    )
+
+    if raw is None:
+        data["training_preference"] = "unknown"
+    else:
+        value = str(
+            raw
+        ).lower().strip()
+
+        if value not in {
             "membership",
             "personal_training",
             "hybrid",
             "trial",
             "unknown",
         }:
-            data["training_preference"] = preference
+            if _has_phrase(
+                value,
+                [
+                    "personal training",
+                    "personal trainer",
+                    "one-on-one",
+                    "one on one",
+                    "trainer",
+                    "hands-on guidance",
+                    "guided training",
+                    "accountability",
+                ],
+            ):
+                data["training_preference"] = (
+                    "personal_training"
+                )
 
-        elif any(
-            phrase in preference
-            for phrase in [
-                "personal training",
-                "personal trainer",
-                "one-on-one",
-                "one on one",
-                "directly with a trainer",
-                "hands-on guidance",
-                "guided approach",
-            ]
-        ):
-            data["training_preference"] = "personal_training"
+            elif "hybrid" in value:
+                data["training_preference"] = "hybrid"
 
-        elif "hybrid" in preference:
-            data["training_preference"] = "hybrid"
+            elif "trial" in value:
+                data["training_preference"] = "trial"
 
-        elif "trial" in preference:
-            data["training_preference"] = "trial"
+            elif "membership" in value:
+                data["training_preference"] = "membership"
 
-        elif "membership" in preference:
-            data["training_preference"] = "membership"
+            else:
+                data["training_preference"] = "unknown"
 
         else:
-            # Important:
-            # "Trains 5 days a week" is NOT a service preference.
-            data["training_preference"] = "unknown"
+            data["training_preference"] = value
 
-    # --------------------------------------------------------
-    # NEXT STEP INTENT
-    # --------------------------------------------------------
+    # ========================================================
+    # NEXT STEP
+    # ========================================================
 
-    raw_next_step = data.get("next_step_intent")
+    raw = data.get(
+        "next_step_intent"
+    )
 
-    if raw_next_step is None:
+    if raw is None:
         data["next_step_intent"] = "unknown"
-
     else:
-        next_step = str(raw_next_step).lower().strip()
+        value = str(
+            raw
+        ).lower().strip()
 
-        if next_step in {
+        if value not in {
             "accepted",
             "interested",
             "maybe",
             "declined",
             "unknown",
         }:
-            data["next_step_intent"] = next_step
+            if _has_phrase(
+                value,
+                [
+                    "accepted",
+                    "agreed",
+                    "definitely",
+                    "happy to",
+                    "yes",
+                ],
+            ):
+                data["next_step_intent"] = "accepted"
 
-        elif any(
-            phrase in next_step
-            for phrase in [
-                "accepted",
-                "agreed",
-                "yes",
-                "definitely",
-                "happy to",
-                "sure",
-            ]
-        ):
-            data["next_step_intent"] = "accepted"
+            elif _has_phrase(
+                value,
+                [
+                    "interested",
+                    "open to",
+                    "would like",
+                    "sounds good",
+                ],
+            ):
+                data["next_step_intent"] = "interested"
 
-        elif any(
-            phrase in next_step
-            for phrase in [
-                "interested",
-                "open to",
-                "would like",
-                "sounds good",
-            ]
-        ):
-            data["next_step_intent"] = "interested"
+            elif "maybe" in value:
+                data["next_step_intent"] = "maybe"
 
-        elif "maybe" in next_step:
-            data["next_step_intent"] = "maybe"
+            elif _has_phrase(
+                value,
+                [
+                    "not interested",
+                    "don't want",
+                    "do not want",
+                    "declined",
+                ],
+            ):
+                data["next_step_intent"] = "declined"
 
-        elif any(
-            phrase in next_step
-            for phrase in [
-                "declined",
-                "no",
-                "not interested",
-                "don't want",
-            ]
-        ):
-            data["next_step_intent"] = "declined"
-
+            else:
+                data["next_step_intent"] = "unknown"
         else:
-            data["next_step_intent"] = "unknown"
+            data["next_step_intent"] = value
 
-    # --------------------------------------------------------
+    # ========================================================
     # NUMERIC FIELDS
-    # --------------------------------------------------------
+    # ========================================================
 
     for field in [
         "engagement",
         "program_fit",
         "goal_clarity",
     ]:
-        value = data.get(field, 0)
+        value = data.get(
+            field,
+            0,
+        )
 
         try:
-            value = int(float(value))
-        except (TypeError, ValueError):
+            value = int(
+                float(value)
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
             value = 0
 
-        data[field] = max(0, min(10, value))
+        data[field] = max(
+            0,
+            min(
+                10,
+                value,
+            ),
+        )
 
-    # --------------------------------------------------------
-    # HUMAN HANDOFF
-    # --------------------------------------------------------
+    # ========================================================
+    # HUMAN
+    # ========================================================
 
-    value = data.get("needs_human", False)
-
-    if isinstance(value, str):
-        data["needs_human"] = value.lower() in {
-            "true",
-            "yes",
-            "1",
-        }
-    else:
-        data["needs_human"] = bool(value)
+    data["needs_human"] = bool(
+        data.get(
+            "needs_human",
+            False,
+        )
+    )
 
     return data
 
 
-# ============================================================
-# LEAD EXTRACTION
-# ============================================================
+def merge_lead_data(
+    existing: LeadProfile,
+    extracted: dict[str, Any],
+) -> LeadProfile:
+
+    current = existing.model_dump()
+
+    text_fields = [
+        "name",
+        "intent",
+        "goal",
+        "current_situation",
+        "problem",
+        "previous_attempts",
+        "desired_outcome",
+        "location",
+        "availability",
+    ]
+
+    for field in text_fields:
+        value = extracted.get(field)
+
+        if value:
+            current[field] = value
+
+    categorical_fields = [
+        "experience",
+        "timeline",
+        "training_preference",
+        "next_step_intent",
+    ]
+
+    for field in categorical_fields:
+        value = extracted.get(field)
+
+        if value and value != "unknown":
+            current[field] = value
+
+    for field in [
+        "engagement",
+        "program_fit",
+        "goal_clarity",
+    ]:
+        value = extracted.get(field)
+
+        if value is not None:
+            current[field] = value
+
+    # needs_human is NOT allowed to determine final handoff.
+    # Final handoff is decided deterministically later.
+    current["needs_human"] = False
+
+    return LeadProfile(
+        **current
+    )
+
 
 def extract_lead_information() -> LeadProfile:
-    """
-    Analyse the full conversation and extract the current
-    structured lead profile.
-    """
 
     if not conversation.messages:
         return conversation.lead
 
-    conversation_text = []
-
-    for message in conversation.messages:
-        conversation_text.append(
-            f"{message.role.upper()}: {message.content}"
-        )
-
-    transcript = "\n".join(conversation_text)
+    transcript = _conversation_text()
 
     extraction_prompt = f"""
 {LEAD_EXTRACTION_PROMPT}
 
-VERY IMPORTANT:
+CURRENT PROFILE:
 
-Return ONLY valid JSON.
-
-Do not return markdown.
-Do not explain your answer.
-Do not add comments.
-
-Use these EXACT values for enum fields:
-
-experience:
-- beginner
-- returning
-- currently_training
-- experienced
-- unknown
-
-timeline:
-- immediate
-- within_7_days
-- within_30_days
-- later
-- researching
-- unknown
-
-training_preference:
-- membership
-- personal_training
-- hybrid
-- trial
-- unknown
-
-next_step_intent:
-- accepted
-- interested
-- maybe
-- declined
-- unknown
-
-If information is not known, use null for normal text fields
-and "unknown" for enum fields.
-
-IMPORTANT FIELD DISTINCTIONS:
-
-experience:
-How experienced the person is with fitness/training.
-
-current_situation:
-What they currently do.
-Example:
-"Training five days a week independently."
-
-training_preference:
-What kind of NextFit support/service they want.
-Example:
-"personal_training"
-
-Do NOT put their current training schedule into training_preference.
-
-timeline:
-When they want to start.
-
-availability:
-Their preferred days/times for training or contact.
-
-next_step_intent:
-Whether they accepted, showed interest in, were unsure about,
-or declined the next step.
-
-needs_human:
-True only when human follow-up is actually appropriate.
+{json.dumps(
+    conversation.lead.model_dump(),
+    indent=2,
+    default=str,
+)}
 
 CONVERSATION:
 
@@ -590,8 +766,8 @@ CONVERSATION:
                 {
                     "role": "system",
                     "content": (
-                        "You are a precise lead data extraction "
-                        "engine. Return valid JSON only."
+                        "You are a precise lead extraction engine. "
+                        "Return JSON only."
                     ),
                 },
                 {
@@ -600,112 +776,84 @@ CONVERSATION:
                 },
             ],
             temperature=0.1,
-            max_tokens=800,
+            max_tokens=1000,
             reasoning_effort="none",
             reasoning_format="hidden",
         )
 
         raw_content = (
-            completion.choices[0].message.content or ""
+            completion
+            .choices[0]
+            .message
+            .content
+            or ""
         ).strip()
 
-        cleaned_content = clean_json_response(raw_content)
-
-        extracted_data = json.loads(cleaned_content)
-
-        print()
-        print("========================================")
-        print("RAW EXTRACTED DATA")
-        print("========================================")
-        print(json.dumps(extracted_data, indent=2))
-        print("========================================")
-
-        # Normalize before Pydantic validation
-        extracted_data = normalize_lead_data(
-            extracted_data
+        cleaned = clean_json_response(
+            raw_content
         )
 
-        print("NORMALIZED LEAD DATA")
-        print("========================================")
-        print(json.dumps(extracted_data, indent=2))
-        print("========================================")
+        extracted_data = json.loads(
+            cleaned
+        )
 
-        # ----------------------------------------------------
-        # Pydantic validation
-        # ----------------------------------------------------
+        extracted_data = normalize_lead_data(
+            extracted_data,
+            transcript,
+        )
 
-        new_lead = LeadProfile(**extracted_data)
-
-        # ----------------------------------------------------
-        # Update conversation state
-        # ----------------------------------------------------
+        new_lead = merge_lead_data(
+            conversation.lead,
+            extracted_data,
+        )
 
         conversation.lead = new_lead
 
-        print("LEAD UPDATED SUCCESSFULLY")
-        print("========================================")
-        print(new_lead.model_dump())
-        print("========================================")
+        print()
+        print("=" * 50)
+        print("LEAD UPDATED")
+        print("=" * 50)
+        print(
+            json.dumps(
+                new_lead.model_dump(),
+                indent=2,
+                default=str,
+            )
+        )
+        print("=" * 50)
         print()
 
         return new_lead
 
     except json.JSONDecodeError as error:
-        print()
-        print("========================================")
-        print("LEAD EXTRACTION JSON ERROR")
-        print("========================================")
-        print(repr(error))
-        print("RAW CONTENT:")
-        print(raw_content if "raw_content" in locals() else "N/A")
-        print("========================================")
-        print()
-
+        print(
+            "LEAD JSON ERROR:",
+            repr(error),
+        )
         return conversation.lead
 
     except ValidationError as error:
-        print()
-        print("========================================")
-        print("LEAD PYDANTIC VALIDATION ERROR")
-        print("========================================")
-        print(error)
-        print()
-        print("EXTRACTED DATA:")
         print(
-            json.dumps(
-                extracted_data,
-                indent=2,
-                default=str,
-            )
+            "LEAD VALIDATION ERROR:",
+            error,
         )
-        print("========================================")
-        print()
-
         return conversation.lead
 
     except Exception as error:
-        print()
-        print("========================================")
-        print("LEAD EXTRACTION ERROR")
-        print("========================================")
-        print(type(error).__name__)
-        print(str(error))
-        print("========================================")
-        print()
-
+        print(
+            "LEAD EXTRACTION ERROR:",
+            type(error).__name__,
+            str(error),
+        )
         return conversation.lead
 
-
-# ============================================================
-# ROUTES
-# ============================================================
 
 @app.get("/")
 def root():
     return {
         "status": "online",
         "service": "Vantix NextFit AI Receptionist",
-        "version": "0.2.0",
+        "version": "0.4.0",
     }
 
 
@@ -717,42 +865,36 @@ def health():
     }
 
 
-# ============================================================
-# CHAT
-# ============================================================
-
 @app.post(
     "/chat",
     response_model=ChatResponse,
 )
-def chat(request: ChatRequest):
+def chat(
+    request: ChatRequest,
+):
 
-    # --------------------------------------------------------
-    # VALIDATE MESSAGE
-    # --------------------------------------------------------
+    global conversation
 
-    if not request.message.strip():
+    user_message = request.message.strip()
+
+    if not user_message:
         raise HTTPException(
             status_code=400,
             detail="Message cannot be empty.",
         )
 
-    # --------------------------------------------------------
-    # ADD USER MESSAGE
-    # --------------------------------------------------------
-
     conversation.messages.append(
         ConversationMessage(
             role="user",
-            content=request.message.strip(),
+            content=user_message,
         )
     )
 
     conversation.turn_count += 1
 
-    # --------------------------------------------------------
-    # BUILD MESSAGE HISTORY
-    # --------------------------------------------------------
+    # Extract user information BEFORE AI response
+    # so the AI knows what is already known.
+    lead = extract_lead_information()
 
     messages = [
         {
@@ -769,50 +911,43 @@ def chat(request: ChatRequest):
             }
         )
 
-    # --------------------------------------------------------
-    # CALL GROQ FOR CONVERSATION
-    # --------------------------------------------------------
-
     try:
         completion = client.chat.completions.create(
             model="qwen/qwen3.6-27b",
             messages=messages,
-            temperature=0.7,
-            max_tokens=350,
+            temperature=0.75,
+            max_tokens=400,
             reasoning_effort="none",
             reasoning_format="hidden",
         )
 
         response_text = (
-            completion.choices[0].message.content or ""
+            completion
+            .choices[0]
+            .message
+            .content
+            or ""
         ).strip()
 
     except Exception as error:
-        # Remove the user message if the AI call completely failed
-        # so the conversation state isn't corrupted.
+
         conversation.messages.pop()
+
         conversation.turn_count = max(
             0,
             conversation.turn_count - 1,
         )
 
-        print()
-        print("========================================")
-        print("GROQ CHAT ERROR")
-        print("========================================")
-        print(type(error).__name__)
-        print(str(error))
-        print("========================================")
-        print()
+        print(
+            "GROQ CHAT ERROR:",
+            type(error).__name__,
+            str(error),
+        )
 
         raise HTTPException(
             status_code=500,
             detail="AI service temporarily unavailable.",
         )
-
-    # --------------------------------------------------------
-    # STORE AI RESPONSE
-    # --------------------------------------------------------
 
     conversation.messages.append(
         ConversationMessage(
@@ -821,25 +956,40 @@ def chat(request: ChatRequest):
         )
     )
 
-    # --------------------------------------------------------
-    # EXTRACT / UPDATE LEAD
-    # --------------------------------------------------------
-
+    # Extract again after assistant response so the
+    # persistent profile is refreshed from the full transcript.
     lead = extract_lead_information()
 
-    # --------------------------------------------------------
-    # QUALIFICATION
-    # --------------------------------------------------------
+    result = calculate_qualification(
+        lead
+    )
 
-    result = calculate_qualification(lead)
+    # ========================================================
+    # DETERMINISTIC HANDOFF
+    # ========================================================
 
-    # --------------------------------------------------------
-    # RETURN
-    # --------------------------------------------------------
+    conversation.handoff_required = (
+        is_fully_qualified(lead)
+        and lead.next_step_intent
+        in {
+            "accepted",
+            "interested",
+        }
+        and result.score >= 65
+    )
+
+    # Only expose handoff once deterministic conditions are met.
+    lead.needs_human = conversation.handoff_required
+
+    conversation.lead = lead
+
+    conversation.conversation_complete = (
+        conversation.handoff_required
+    )
 
     return ChatResponse(
         response=response_text,
-        lead=result.lead,
+        lead=lead,
         score=result.score,
         classification=result.classification,
         reasons=result.reasons,
@@ -847,15 +997,8 @@ def chat(request: ChatRequest):
     )
 
 
-# ============================================================
-# RESET CONVERSATION
-# ============================================================
-
 @app.post("/reset")
 def reset_conversation():
-    """
-    Reset the current demo conversation.
-    """
 
     global conversation
 

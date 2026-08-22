@@ -1,48 +1,63 @@
-from typing import Optional, Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
 
+Experience = Literal[
+    "beginner",
+    "returning",
+    "currently_training",
+    "experienced",
+    "unknown",
+]
+
+Timeline = Literal[
+    "immediate",
+    "within_7_days",
+    "within_30_days",
+    "later",
+    "researching",
+    "unknown",
+]
+
+TrainingPreference = Literal[
+    "membership",
+    "personal_training",
+    "hybrid",
+    "trial",
+    "unknown",
+]
+
+NextStepIntent = Literal[
+    "accepted",
+    "interested",
+    "maybe",
+    "declined",
+    "unknown",
+]
+
+
 class LeadProfile(BaseModel):
     """
-    Structured information collected naturally
+    Persistent structured information collected naturally
     during a NextFit conversation.
     """
 
     name: Optional[str] = None
-
     intent: Optional[str] = None
     goal: Optional[str] = None
     current_situation: Optional[str] = None
     problem: Optional[str] = None
+    previous_attempts: Optional[str] = None
     desired_outcome: Optional[str] = None
 
-    experience: Literal[
-        "beginner",
-        "returning",
-        "currently_training",
-        "experienced",
-        "unknown",
-    ] = "unknown"
+    experience: Experience = "unknown"
 
     location: Optional[str] = None
 
-    timeline: Literal[
-        "immediate",
-        "within_7_days",
-        "within_30_days",
-        "later",
-        "researching",
-        "unknown",
-    ] = "unknown"
+    timeline: Timeline = "unknown"
 
-    training_preference: Literal[
-        "membership",
-        "personal_training",
-        "hybrid",
-        "trial",
-        "unknown",
-    ] = "unknown"
+    training_preference: TrainingPreference = "unknown"
 
     availability: Optional[str] = None
 
@@ -50,64 +65,34 @@ class LeadProfile(BaseModel):
     program_fit: int = Field(default=0, ge=0, le=10)
     goal_clarity: int = Field(default=0, ge=0, le=10)
 
-    next_step_intent: Literal[
-        "accepted",
-        "interested",
-        "maybe",
-        "declined",
-        "unknown",
-    ] = "unknown"
+    next_step_intent: NextStepIntent = "unknown"
 
     needs_human: bool = False
 
 
 class LeadUpdate(BaseModel):
     """
-    Partial lead information extracted from the latest conversation.
+    Partial lead information extracted from the conversation.
 
-    Only fields actually supported by the conversation are populated.
+    Fields are optional because the extractor should only provide
+    information that is actually supported by the conversation.
     """
 
     name: Optional[str] = None
-
     intent: Optional[str] = None
     goal: Optional[str] = None
     current_situation: Optional[str] = None
     problem: Optional[str] = None
+    previous_attempts: Optional[str] = None
     desired_outcome: Optional[str] = None
 
-    experience: Optional[
-        Literal[
-            "beginner",
-            "returning",
-            "currently_training",
-            "experienced",
-            "unknown",
-        ]
-    ] = None
+    experience: Optional[Experience] = None
 
     location: Optional[str] = None
 
-    timeline: Optional[
-        Literal[
-            "immediate",
-            "within_7_days",
-            "within_30_days",
-            "later",
-            "researching",
-            "unknown",
-        ]
-    ] = None
+    timeline: Optional[Timeline] = None
 
-    training_preference: Optional[
-        Literal[
-            "membership",
-            "personal_training",
-            "hybrid",
-            "trial",
-            "unknown",
-        ]
-    ] = None
+    training_preference: Optional[TrainingPreference] = None
 
     availability: Optional[str] = None
 
@@ -129,24 +114,12 @@ class LeadUpdate(BaseModel):
         le=10,
     )
 
-    next_step_intent: Optional[
-        Literal[
-            "accepted",
-            "interested",
-            "maybe",
-            "declined",
-            "unknown",
-        ]
-    ] = None
+    next_step_intent: Optional[NextStepIntent] = None
 
     needs_human: Optional[bool] = None
 
 
 class QualificationResult(BaseModel):
-    """
-    Final deterministic qualification result.
-    """
-
     score: int = Field(
         ge=0,
         le=100,
@@ -160,7 +133,7 @@ class QualificationResult(BaseModel):
         "LOW",
     ]
 
-    reasons: list[str] = []
+    reasons: list[str] = Field(default_factory=list)
 
     recommended_action: str
 

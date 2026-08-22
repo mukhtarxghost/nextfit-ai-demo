@@ -1,5 +1,6 @@
-from typing import List, Literal, Optional
-from pydantic import BaseModel
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
 
 from .models import LeadProfile
 
@@ -10,9 +11,18 @@ class ConversationMessage(BaseModel):
 
 
 class ConversationState(BaseModel):
-    messages: List[ConversationMessage] = []
-    lead: LeadProfile = LeadProfile()
+    messages: list[ConversationMessage] = Field(
+        default_factory=list
+    )
+
+    lead: LeadProfile = Field(
+        default_factory=LeadProfile
+    )
+
     conversation_complete: bool = False
+
     handoff_required: bool = False
+
     turn_count: int = 0
+
     last_question: Optional[str] = None
