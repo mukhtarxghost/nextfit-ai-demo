@@ -1,4 +1,4 @@
-from .models import LeadProfile, QualificationResult
+from models import LeadProfile, QualificationResult
 
 
 def _has_text(

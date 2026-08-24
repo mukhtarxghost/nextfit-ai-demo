@@ -6,38 +6,60 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from groq import Groq
+from elevenlabs.client import ElevenLabs
 from pydantic import BaseModel, ValidationError
 
-from .conversation import ConversationMessage, ConversationState
-from .models import LeadProfile
-from .prompts import (
+from conversation import ConversationMessage, ConversationState
+from models import LeadProfile
+from prompts import (
     LEAD_EXTRACTION_PROMPT,
     NEXTFIT_SYSTEM_PROMPT,
 )
-from .qualification import (
+from qualification import (
     calculate_qualification,
     get_missing_qualification_fields,
     get_qualification_status,
     is_fully_qualified,
 )
-from .nextfit_config import NEXTFIT_CONFIG
-
-
+from nextfit_config import NEXTFIT_CONFIG
 # ============================================================
 # ENVIRONMENT
 # ============================================================
 
 load_dotenv()
 
-api_key = os.getenv("GROQ_API_KEY")
+groq_api_key = os.getenv("GROQ_API_KEY")
 
-if not api_key:
+if not groq_api_key:
     raise RuntimeError(
         "GROQ_API_KEY is missing. Add it to your .env file."
     )
 
-client = Groq(api_key=api_key)
+client = Groq(api_key=groq_api_key)
+
+
+# ============================================================
+# ELEVENLABS CONFIGURATION
+# ============================================================
+
+elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+elevenlabs_voice_id = os.getenv("ELEVENLABS_VOICE_ID")
+
+if not elevenlabs_api_key:
+    raise RuntimeError(
+        "ELEVENLABS_API_KEY is missing. Add it to your .env file."
+    )
+
+if not elevenlabs_voice_id:
+    raise RuntimeError(
+        "ELEVENLABS_VOICE_ID is missing. Add it to your .env file."
+    )
+
+elevenlabs_client = ElevenLabs(
+    api_key=elevenlabs_api_key
+)
 
 
 # ============================================================
@@ -50,7 +72,7 @@ app = FastAPI(
         "Conversational AI receptionist and deterministic "
         "lead qualification system for NextFit."
     ),
-    version="0.5.0",
+    version="0.6.0",
 )
 
 
@@ -82,6 +104,10 @@ class ChatResponse(BaseModel):
     classification: str
     reasons: list[str]
     recommended_action: str
+
+
+class TTSRequest(BaseModel):
+    text: str
 
 
 # ============================================================
@@ -389,6 +415,7 @@ def _normalize_text(value: Any) -> Any:
 def normalize_phone_number(
     value: Any,
 ) -> str | None:
+
     if value is None:
         return None
 
@@ -397,7 +424,6 @@ def normalize_phone_number(
     if not value:
         return None
 
-    # Remove common formatting characters.
     cleaned = re.sub(
         r"[^\d+]",
         "",
@@ -407,12 +433,6 @@ def normalize_phone_number(
     if not cleaned:
         return None
 
-    # Indian numbers:
-    #
-    # 9876543210
-    # +919876543210
-    # 919876543210
-    #
     digits = re.sub(
         r"\D",
         "",
@@ -428,8 +448,6 @@ def normalize_phone_number(
     ):
         return "+" + digits
 
-    # Keep other explicitly provided numbers rather than
-    # destroying potentially valid international numbers.
     if len(digits) >= 7:
         if cleaned.startswith("+"):
             return "+" + digits
@@ -455,6 +473,7 @@ def _has_phrase(
     text: str,
     phrases: list[str],
 ) -> bool:
+
     text = text.lower()
 
     return any(
@@ -474,7 +493,6 @@ def infer_experience_from_conversation(
 
     text = transcript.lower()
 
-    # Beginner
     if _has_phrase(
         text,
         [
@@ -489,7 +507,6 @@ def infer_experience_from_conversation(
     ):
         return "beginner"
 
-    # Returning
     if _has_phrase(
         text,
         [
@@ -504,7 +521,6 @@ def infer_experience_from_conversation(
     ):
         return "returning"
 
-    # Currently training
     if _has_phrase(
         text,
         [
@@ -524,10 +540,12 @@ def infer_experience_from_conversation(
             "i have been training",
         ],
     ):
+
         if re.search(
             r"\b(?:2|3|4|5|6|7|8|9|1[0-9])\s*(?:\+)?\s*years?\b",
             text,
         ):
+
             if _has_phrase(
                 text,
                 [
@@ -542,11 +560,11 @@ def infer_experience_from_conversation(
 
         return "currently_training"
 
-    # Experienced
     if re.search(
         r"\b(?:2|3|4|5|6|7|8|9|1[0-9])\s*(?:\+)?\s*years?\b",
         text,
     ):
+
         if _has_phrase(
             text,
             [
@@ -618,7 +636,6 @@ def infer_timeline_from_conversation(
     if promotional_context and not joining_context:
         return None
 
-    # Immediate
     if _has_phrase(
         text,
         [
@@ -629,9 +646,9 @@ def infer_timeline_from_conversation(
             "asap",
         ],
     ) and joining_context:
+
         return "immediate"
 
-    # Within 7 days
     if _has_phrase(
         text,
         [
@@ -642,9 +659,9 @@ def infer_timeline_from_conversation(
             "in a few days",
         ],
     ) and joining_context:
+
         return "within_7_days"
 
-    # Within 30 days
     if _has_phrase(
         text,
         [
@@ -654,9 +671,9 @@ def infer_timeline_from_conversation(
             "next month",
         ],
     ) and joining_context:
+
         return "within_30_days"
 
-    # Researching
     if _has_phrase(
         text,
         [
@@ -670,7 +687,6 @@ def infer_timeline_from_conversation(
     ):
         return "researching"
 
-    # Later
     if _has_phrase(
         text,
         [
@@ -711,7 +727,6 @@ def normalize_lead_data(
             data.get(field)
         )
 
-    # Phone
     data["phone_number"] = normalize_phone_number(
         data.get("phone_number")
     )
@@ -728,11 +743,13 @@ def normalize_lead_data(
 
     if inferred_experience:
         data["experience"] = inferred_experience
+
     else:
         raw = data.get("experience")
 
         if raw is None:
             data["experience"] = "unknown"
+
         else:
             value = str(raw).lower().strip()
 
@@ -744,6 +761,7 @@ def normalize_lead_data(
                 "unknown",
             }:
                 data["experience"] = "unknown"
+
             else:
                 data["experience"] = value
 
@@ -759,11 +777,13 @@ def normalize_lead_data(
 
     if inferred_timeline:
         data["timeline"] = inferred_timeline
+
     else:
         raw = data.get("timeline")
 
         if raw is None:
             data["timeline"] = "unknown"
+
         else:
             value = str(raw).lower().strip()
 
@@ -776,6 +796,7 @@ def normalize_lead_data(
                 "unknown",
             }:
                 data["timeline"] = "unknown"
+
             else:
                 data["timeline"] = value
 
@@ -787,6 +808,7 @@ def normalize_lead_data(
 
     if raw is None:
         data["training_preference"] = "unknown"
+
     else:
         value = str(raw).lower().strip()
 
@@ -839,6 +861,7 @@ def normalize_lead_data(
 
     if raw is None:
         data["next_step_intent"] = "unknown"
+
     else:
         value = str(raw).lower().strip()
 
@@ -912,6 +935,7 @@ def normalize_lead_data(
 
         try:
             value = int(float(value))
+
         except (
             TypeError,
             ValueError,
@@ -927,7 +951,6 @@ def normalize_lead_data(
     # HUMAN HANDOFF
     # ========================================================
 
-    # Never allow the LLM to directly trigger handoff.
     data["needs_human"] = False
 
     return data
@@ -990,7 +1013,6 @@ def merge_lead_data(
         if value is not None:
             current[field] = value
 
-    # Deterministic handoff only.
     current["needs_human"] = False
 
     return LeadProfile(**current)
@@ -1126,6 +1148,7 @@ CONVERSATION:
 def contact_details_complete(
     lead: LeadProfile,
 ) -> bool:
+
     return bool(
         lead.name
         and lead.phone_number
@@ -1137,6 +1160,7 @@ def handoff_eligible(
     lead: LeadProfile,
     score: int,
 ) -> bool:
+
     return (
         is_fully_qualified(lead)
         and lead.next_step_intent
@@ -1159,7 +1183,8 @@ def root():
     return {
         "status": "online",
         "service": "Vantix NextFit AI Receptionist",
-        "version": "0.5.0",
+        "version": "0.6.0",
+        "tts": "elevenlabs",
     }
 
 
@@ -1182,6 +1207,10 @@ def health():
         ),
         "contact_details_complete": contact_details_complete(
             conversation.lead
+        ),
+        "tts_configured": bool(
+            elevenlabs_api_key
+            and elevenlabs_voice_id
         ),
     }
 
@@ -1274,7 +1303,6 @@ def chat(
 
     except Exception as error:
 
-        # Roll back failed user turn.
         conversation.messages.pop()
 
         conversation.turn_count = max(
@@ -1320,14 +1348,6 @@ def chat(
 
     # --------------------------------------------------------
     # DETERMINISTIC HANDOFF
-    #
-    # Stage 1:
-    # Qualification + genuine interest
-    #
-    # Stage 2:
-    # Contact details
-    #
-    # Only Stage 2 is considered complete handoff.
     # --------------------------------------------------------
 
     qualification_ready = handoff_eligible(
@@ -1366,6 +1386,65 @@ def chat(
         reasons=result.reasons,
         recommended_action=result.recommended_action,
     )
+
+
+# ============================================================
+# ELEVENLABS TEXT TO SPEECH
+# ============================================================
+
+
+@app.post("/tts")
+def text_to_speech(
+    request: TTSRequest,
+):
+
+    text = request.text.strip()
+
+    if not text:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    if len(text) > 2000:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Text is too long for a single TTS request.",
+        )
+
+    try:
+
+        audio = elevenlabs_client.text_to_speech.convert(
+            text=text,
+            voice_id=elevenlabs_voice_id,
+            model_id="eleven_flash_v2_5",
+            output_format="mp3_22050_32",
+        )
+
+        audio_bytes = b"".join(audio)
+
+        return Response(
+            content=audio_bytes,
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "inline"
+            },
+        )
+
+    except Exception as error:
+
+        print(
+            "ELEVENLABS TTS ERROR:",
+            type(error).__name__,
+            str(error),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Text-to-speech service temporarily unavailable.",
+        )
 
 
 # ============================================================

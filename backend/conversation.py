@@ -2,7 +2,7 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from .models import LeadProfile
+from models import LeadProfile
 
 
 class ConversationMessage(BaseModel):
