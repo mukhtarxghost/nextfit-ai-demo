@@ -13,7 +13,7 @@ from conversation import ConversationMessage, ConversationState
 from models import LeadProfile
 from prompts import (
     LEAD_EXTRACTION_PROMPT,
-    NEXTFIT_SYSTEM_PROMPT,
+    NEXTFIT_CHAT_PROMPT,
 )
 from qualification import (
     calculate_qualification,
@@ -28,9 +28,36 @@ from nextfit_config import NEXTFIT_CONFIG
 # CLOUDFLARE ENVIRONMENT / SECRETS
 # ============================================================
 
-GROQ_API_KEY = getattr(env, "GROQ_API_KEY", None)
-ELEVENLABS_API_KEY = getattr(env, "ELEVENLABS_API_KEY", None)
-ELEVENLABS_VOICE_ID = getattr(env, "ELEVENLABS_VOICE_ID", None)
+
+def _clean_secret_value(
+    value: Any,
+    name: str,
+) -> str | None:
+
+    if value is None:
+        return None
+
+    cleaned = str(value).strip().strip('"\'')
+    prefix = f"{name}="
+
+    if cleaned.startswith(prefix):
+        cleaned = cleaned[len(prefix):].strip().strip('"\'')
+
+    return cleaned or None
+
+
+GROQ_API_KEY = _clean_secret_value(
+    getattr(env, "GROQ_API_KEY", None),
+    "GROQ_API_KEY",
+)
+ELEVENLABS_API_KEY = _clean_secret_value(
+    getattr(env, "ELEVENLABS_API_KEY", None),
+    "ELEVENLABS_API_KEY",
+)
+ELEVENLABS_VOICE_ID = _clean_secret_value(
+    getattr(env, "ELEVENLABS_VOICE_ID", None),
+    "ELEVENLABS_VOICE_ID",
+)
 
 
 # ============================================================
@@ -91,6 +118,18 @@ class TTSRequest(BaseModel):
 
 conversation = ConversationState()
 
+MAX_HISTORY_MESSAGES = 6
+CHAT_MAX_TOKENS = 220
+EXTRACTION_MAX_TOKENS = 320
+
+
+class GroqRateLimitError(RuntimeError):
+    """A rate limit response that callers can handle without retrying."""
+
+    def __init__(self, retry_after: str | None = None):
+        super().__init__("Groq rate limit reached")
+        self.retry_after = retry_after
+
 
 # ============================================================
 # API CONFIGURATION
@@ -133,6 +172,20 @@ async def groq_chat(
             "type": "json_object"
         }
 
+    print(
+        "GROQ CHAT REQUEST:",
+        len(messages),
+        "messages",
+        sum(
+            len(message.get("content", ""))
+            for message in messages
+        ),
+        "input chars max_tokens=",
+        max_tokens,
+        "json_mode=",
+        json_mode,
+    )
+
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(60.0)
     ) as client:
@@ -147,16 +200,28 @@ async def groq_chat(
         )
 
     if response.status_code >= 400:
+        if response.status_code == 429:
+            retry_after = response.headers.get(
+                "retry-after"
+            )
+            print(
+                "GROQ 429 retry_after=",
+                retry_after or "unknown",
+            )
+            raise GroqRateLimitError(
+                retry_after
+            )
+
         print(
             "GROQ API ERROR:",
             response.status_code,
-            response.text,
         )
 
         raise RuntimeError(
             f"Groq API returned {response.status_code}"
         )
 
+    print("GROQ CHAT SUCCESS")
     return response.json()
 
 
@@ -229,30 +294,10 @@ def build_business_info() -> str:
         NEXTFIT_CONFIG["services"]
     )
 
-    return f"""
-BUSINESS CONFIGURATION
-
-Business:
-{NEXTFIT_CONFIG["business_name"]}
-
-Primary Location:
-{NEXTFIT_CONFIG["location"]}
-
-Services:
-{services}
-
-Known Information:
-{json.dumps(
-    NEXTFIT_CONFIG["known_information"],
-    indent=2,
-)}
-
-Business Rules:
-{chr(10).join(
-    "- " + rule
-    for rule in NEXTFIT_CONFIG["rules"]
-)}
-"""
+    return (
+        f"VERIFIED BUSINESS: {NEXTFIT_CONFIG['business_name']}; "
+        f"location: {NEXTFIT_CONFIG['location']}; services: {services}."
+    )
 
 
 # ============================================================
@@ -323,40 +368,14 @@ def build_contact_status() -> str:
             "Do not ask another contact question."
         )
 
-    return f"""
-============================================================
-CONTACT / HANDOFF STATUS
-============================================================
-
-NAME:
-{name_status}
-
-PHONE NUMBER:
-{phone_status}
-
-AVAILABILITY:
-{availability_status}
-
-QUALIFIED + WILLING TO CONTINUE:
-{"YES" if qualification_ready else "NO"}
-
-NEXT CONTACT STEP:
-{next_contact_step}
-
-IMPORTANT:
-
-Never invent contact information.
-
-Never repeat a contact question if the information
-is already collected.
-
-Ask only ONE contact question at a time.
-
-Do not collect name or phone number before genuine
-willingness to continue with the NextFit team.
-
-Do not claim a booking or notification occurred.
-"""
+    return (
+        "CONTACT STATUS: "
+        f"name={name_status}, phone={phone_status}, "
+        f"availability={availability_status}; "
+        f"qualified_and_willing={'YES' if qualification_ready else 'NO'}. "
+        f"NEXT CONTACT STEP: {next_contact_step} "
+        "Ask only one contact question; never invent or repeat details."
+    )
 
 
 # ============================================================
@@ -406,37 +425,14 @@ def build_qualification_status() -> str:
         else "none — core qualification complete"
     )
 
-    return f"""
-============================================================
-QUALIFICATION STATUS
-============================================================
-
-{chr(10).join(lines)}
-
-NEXT PRIORITY:
-{next_priority}
-
-CORE QUALIFICATION COMPLETE:
-{"YES" if is_fully_qualified(lead) else "NO"}
-
-CURRENT NEXT-STEP INTENT:
-{lead.next_step_intent}
-
-IMPORTANT:
-
-Use this information internally.
-
-Do not mention qualification fields to the customer.
-
-Ask only ONE useful question.
-
-Do not make the conversation sound like a checklist.
-
-Do not ask for information already collected.
-
-Do not initiate human handoff before core qualification
-is complete.
-"""
+    return (
+        "QUALIFICATION STATUS (internal): "
+        + "; ".join(lines)
+        + f". next_priority={next_priority}; "
+        f"core_complete={'YES' if is_fully_qualified(lead) else 'NO'}; "
+        f"next_step_intent={lead.next_step_intent}. "
+        "Do not mention fields, use a checklist, or hand off before core completion."
+    )
 
 
 # ============================================================
@@ -447,7 +443,7 @@ is complete.
 def build_system_prompt() -> str:
 
     return (
-        NEXTFIT_SYSTEM_PROMPT
+        NEXTFIT_CHAT_PROMPT
         + "\n\n"
         + build_business_info()
         + "\n\n"
@@ -589,8 +585,85 @@ def _conversation_text() -> str:
 
     return "\n".join(
         f"{message.role.upper()}: {message.content}"
-        for message in conversation.messages
+        for message in conversation.messages[-MAX_HISTORY_MESSAGES:]
     )
+
+
+def should_extract_lead(message: str) -> bool:
+
+    words = re.findall(r"\b\w+\b", message.lower())
+
+    if len(words) < 2:
+        return False
+
+    skip_only = {
+        "hello", "hi", "hey", "yes", "yeah", "yep", "okay",
+        "ok", "sure", "thanks", "thank", "great", "cool",
+    }
+
+    if set(words).issubset(skip_only):
+        return False
+
+    lead_signals = (
+        "want", "need", "looking", "join", "start", "goal",
+        "train", "training", "workout", "gym", "fitness", "lose",
+        "gain", "muscle", "weight", "name", "number", "phone",
+        "live", "area", "pune", "available", "time", "membership",
+        "personal", "trial", "problem", "prefer", "interested",
+    )
+
+    return any(signal in words for signal in lead_signals)
+
+
+def deterministic_response(message: str) -> str | None:
+
+    normalized = re.sub(
+        r"[^a-z0-9 ]",
+        "",
+        message.lower(),
+    ).strip()
+
+    if normalized in {"hi", "hello", "hey"}:
+        return (
+            "Hey, welcome to NextFit. What brings you in today?"
+        )
+
+    if normalized in {"how are you", "how are you doing"}:
+        return (
+            "I'm good, thanks. How's it going? "
+            "What brings you to NextFit?"
+        )
+
+    return None
+
+
+def clean_spoken_response(text: str) -> str:
+
+    text = (text or "").strip()
+
+    text = re.sub(
+        r"<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"<analysis\b[^>]*>.*?</analysis>",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    unmatched_reasoning = re.search(
+        r"<(?:think|thinking|analysis)\b[^>]*>",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if unmatched_reasoning:
+        text = text[:unmatched_reasoning.start()]
+
+    text = re.sub(r"<\|[^>]+\|>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _has_phrase(
@@ -1266,7 +1339,7 @@ CONVERSATION:
                 },
             ],
             temperature=0.1,
-            max_tokens=1200,
+            max_tokens=EXTRACTION_MAX_TOKENS,
             json_mode=True,
         )
 
@@ -1297,6 +1370,8 @@ CONVERSATION:
         )
 
         conversation.lead = new_lead
+
+        print("LEAD EXTRACTION RUN: updated")
 
         print()
         print("=" * 60)
@@ -1337,7 +1412,6 @@ CONVERSATION:
         print(
             "LEAD EXTRACTION ERROR:",
             type(error).__name__,
-            str(error),
         )
 
         return conversation.lead
@@ -1471,10 +1545,14 @@ async def chat(
     conversation.turn_count += 1
 
     # --------------------------------------------------------
-    # EXTRACT BEFORE AI RESPONSE
+    # EXTRACT ONLY WHEN THE TURN CONTAINS LEAD SIGNALS
     # --------------------------------------------------------
 
-    lead = await extract_lead_information()
+    if should_extract_lead(user_message):
+        print("LEAD EXTRACTION RUN")
+        await extract_lead_information()
+    else:
+        print("LEAD EXTRACTION SKIPPED")
 
     # --------------------------------------------------------
     # BUILD CONVERSATION
@@ -1487,7 +1565,7 @@ async def chat(
         }
     ]
 
-    for message in conversation.messages:
+    for message in conversation.messages[-MAX_HISTORY_MESSAGES:]:
 
         messages.append(
             {
@@ -1500,21 +1578,59 @@ async def chat(
     # GENERATE AI RESPONSE
     # --------------------------------------------------------
 
+    response_text = deterministic_response(
+        user_message
+    )
+
+    if response_text:
+        print("GROQ CHAT SKIPPED: deterministic response")
+
     try:
 
-        completion = await groq_chat(
-            messages=messages,
-            temperature=0.75,
-            max_tokens=400,
-        )
+        if not response_text:
+            completion = await groq_chat(
+                messages=messages,
+                temperature=0.75,
+                max_tokens=CHAT_MAX_TOKENS,
+            )
+
+            raw_response_text = (
+                completion
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                or ""
+            ).strip()
+            response_text = clean_spoken_response(
+                raw_response_text
+            )
+
+            if raw_response_text != response_text:
+                print(
+                    "TTS CLEANED RESPONSE:",
+                    len(raw_response_text),
+                    "to",
+                    len(response_text),
+                    "chars",
+                )
+
+        if not response_text:
+            response_text = (
+                "Sorry, I missed that. Could you say that again?"
+            )
+
+    except GroqRateLimitError as error:
 
         response_text = (
-            completion
-            .get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            or ""
-        ).strip()
+            "I'm sorry, I'm a little busy right now. "
+            "Could you give me a moment and try that again?"
+        )
+
+        print(
+            "GROQ CHAT RATE LIMITED; FALLBACK RESPONSE",
+            "retry_after=",
+            error.retry_after or "unknown",
+        )
 
     except Exception as error:
 
@@ -1547,11 +1663,7 @@ async def chat(
         )
     )
 
-    # --------------------------------------------------------
-    # EXTRACT AGAIN FROM FULL TRANSCRIPT
-    # --------------------------------------------------------
-
-    lead = await extract_lead_information()
+    lead = conversation.lead
 
     # --------------------------------------------------------
     # DETERMINISTIC QUALIFICATION
@@ -1609,61 +1721,66 @@ async def chat(
 
 
 @app.post("/tts")
-async def text_to_speech(
-    request: TTSRequest,
-):
+async def elevenlabs_tts(
+    text: str,
+    output_format: str = "mp3_22050_32",
+) -> bytes:
 
-    text = request.text.strip()
+    text = clean_spoken_response(text)
 
-    if not text:
+    print(
+        "TTS CLEANED RESPONSE:",
+        len(text),
+        "chars",
+    )
 
-        raise HTTPException(
-            status_code=400,
-            detail="Text cannot be empty.",
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError(
+            "ELEVENLABS_API_KEY is missing from Cloudflare environment."
         )
 
-    if len(text) > 5000:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Text is too long for a single "
-                "TTS request."
-            ),
+    if not ELEVENLABS_VOICE_ID:
+        raise RuntimeError(
+            "ELEVENLABS_VOICE_ID is missing from Cloudflare environment."
         )
 
-    try:
+    url = (
+        f"{ELEVENLABS_URL}/"
+        f"{ELEVENLABS_VOICE_ID}"
+    )
 
-        audio_bytes = await elevenlabs_tts(
-            text
-        )
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0)
+    ) as client:
 
-        return Response(
-            content=audio_bytes,
-            media_type="audio/mpeg",
+        response = await client.post(
+            url,
+            params={
+                "output_format": output_format,
+            },
             headers={
-                "Content-Disposition": (
-                    "inline; filename=nextfit-tts.mp3"
-                )
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": text,
+                "model_id": "eleven_flash_v2_5",
             },
         )
 
-    except Exception as error:
+    if response.status_code >= 400:
 
         print(
-            "ELEVENLABS TTS ERROR:",
-            type(error).__name__,
-            str(error),
+            "ELEVENLABS API ERROR:",
+            response.status_code,
+            response.text,
         )
 
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Text-to-speech service "
-                "temporarily unavailable."
-            ),
+        raise RuntimeError(
+            f"ElevenLabs API returned {response.status_code}"
         )
 
+    return response.content
 
 # ============================================================
 # RESET

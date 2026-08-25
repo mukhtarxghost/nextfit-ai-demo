@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const API_URL = "http://127.0.0.1:8000";
+const API_URL = "http://127.0.0.1:8787";
 
 function App() {
   const [messages, setMessages] = useState([
@@ -323,6 +323,106 @@ function App() {
   };
 
   // ============================================================
+  // DEFENSIVE AI RESPONSE CLEANING
+  // ============================================================
+
+  const cleanAIResponse = (text) => {
+    if (!text) {
+      return "";
+    }
+
+    let cleaned = String(text).trim();
+
+    // Remove complete <think>...</think> blocks
+    cleaned = cleaned.replace(
+      /<think>.*?<\/think>/gis,
+      ""
+    );
+
+    // Handle unclosed <think> blocks
+    if (/<think>/i.test(cleaned)) {
+      const parts = cleaned.split(/<think>/i);
+      if (parts.length > 1) {
+        const afterThink = parts[parts.length - 1];
+        const closingMatch = afterThink.match(
+          /<\/think>/i
+        );
+
+        if (closingMatch) {
+          cleaned = afterThink.substring(
+            closingMatch.index + closingMatch[0].length
+          );
+        } else {
+          // Try to extract from final answer markers
+          const finalMarkers = [
+            /\bfinal answer\s*:/i,
+            /\bfinal response\s*:/i,
+            /\bresponse\s*:/i,
+            /\banswer\s*:/i,
+          ];
+
+          let extracted = null;
+          for (const marker of finalMarkers) {
+            const match = afterThink.match(marker);
+            if (match) {
+              extracted = afterThink.substring(
+                match.index + match[0].length
+              );
+              break;
+            }
+          }
+
+          cleaned = extracted || "";
+        }
+      }
+    }
+
+    // Remove remaining <think> or </think> tags
+    cleaned = cleaned.replace(/<\/?think>/gi, "");
+
+    // Remove reasoning prefixes
+    cleaned = cleaned.replace(
+      /^\s*(analysis|reasoning|chain[- ]of[- ]thought)\s*:\s*/i,
+      ""
+    );
+
+    cleaned = cleaned.replace(
+      /^\s*(final answer|final response|assistant response)\s*:\s*/i,
+      ""
+    );
+
+    cleaned = cleaned.replace(
+      /^\s*here'?s what (?:i|the ai|the assistant)\s+(?:should|will)\s+say\s*:\s*/i,
+      ""
+    );
+
+    // Remove markdown fences
+    cleaned = cleaned.replace(
+      /^\s*```(?:text)?\s*/i,
+      ""
+    );
+
+    cleaned = cleaned.replace(/\s*```\s*$/i, "");
+
+    // Remove XML/meta wrappers
+    cleaned = cleaned.replace(
+      /^\s*<response>\s*/i,
+      ""
+    );
+
+    cleaned = cleaned.replace(
+      /\s*<\/response>\s*$/i,
+      ""
+    );
+
+    // Normalize whitespace
+    cleaned = cleaned.replace(/[ \t]+/g, " ");
+    cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
+
+    return cleaned.trim();
+  };
+
+  // ============================================================
   // MICROPHONE
   // ============================================================
 
@@ -444,11 +544,15 @@ function App() {
       const data =
         await response.json();
 
+      const cleanedResponse = cleanAIResponse(
+        data.response
+      );
+
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: data.response,
+          content: cleanedResponse,
         },
       ]);
 
@@ -462,7 +566,7 @@ function App() {
           data.recommended_action,
       });
 
-      speakResponse(data.response);
+      speakResponse(cleanedResponse);
     } catch (error) {
       console.error(
         "Chat request failed:",
