@@ -161,6 +161,8 @@ function sendAudioToExotel(server, state, audio) {
 
   state.outboundSequence += 1;
   const markName = `nextfit-tts-${state.outboundSequence}`;
+  state.pendingMark = markName;
+  resetAudioBuffer(state);
 
   server.send(JSON.stringify({
     event: "mark",
@@ -190,6 +192,7 @@ function createConnectionState() {
     processing: false,
     conversationState: emptyConversationState(),
     outboundSequence: 0,
+    pendingMark: null,
   };
 }
 
@@ -249,6 +252,10 @@ function scheduleSilenceTimer(state, processUtterance) {
 }
 
 function appendAudio(state, payload, processUtterance) {
+  if (state.pendingMark) {
+    return;
+  }
+
   const decoded = decodeBase64(payload);
 
   if (!decoded.byteLength) {
@@ -381,7 +388,12 @@ function installMediaSocket(server, env) {
       }
 
       if (eventType === "mark") {
-        console.log("EXOTEL MARK:", message.mark?.name);
+        const markName = message.mark?.name;
+        console.log("EXOTEL MARK:", markName);
+        if (markName && markName === state.pendingMark) {
+          state.pendingMark = null;
+          resetAudioBuffer(state);
+        }
         return;
       }
 

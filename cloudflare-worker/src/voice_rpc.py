@@ -7,10 +7,11 @@ from workers import WorkerEntrypoint
 from conversation import ConversationState
 from main import (
     ChatRequest,
-    GROQ_API_KEY,
     app,
     chat,
     elevenlabs_tts,
+    get_groq_api_key,
+    sync_env,
 )
 
 
@@ -95,7 +96,9 @@ async def _transcribe_audio(pcm_bytes: bytes) -> str | None:
         print("STT SKIPPED:", len(pcm_bytes), "bytes")
         return None
 
-    if not GROQ_API_KEY:
+    api_key = get_groq_api_key()
+
+    if not api_key:
         print("STT ERROR: GROQ_API_KEY missing")
         return None
 
@@ -131,7 +134,7 @@ async def _transcribe_audio(pcm_bytes: bytes) -> str | None:
             response = await client.post(
                 STT_URL,
                 headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}"
+                    "Authorization": f"Bearer {api_key}"
                 },
                 data=data,
                 files=files,
@@ -166,6 +169,7 @@ class VoiceEntrypoint(WorkerEntrypoint):
     """Utterance-level Python service called by the native media Worker."""
 
     async def fetch(self, request):
+        sync_env(self.env)
         return await asgi.fetch(
             app,
             request,
@@ -176,6 +180,8 @@ class VoiceEntrypoint(WorkerEntrypoint):
         self,
         request: dict[str, Any],
     ) -> dict[str, Any]:
+
+        sync_env(self.env)
 
         request = _plain_value(request)
         call_sid = request.get("callSid")

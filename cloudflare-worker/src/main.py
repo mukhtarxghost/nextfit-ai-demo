@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from contextvars import ContextVar
 from typing import Any
@@ -8,7 +9,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, ValidationError
-from workers import env
+try:
+    from workers import env
+except ImportError:
+    env = None
 
 from conversation import ConversationMessage, ConversationState
 from models import LeadProfile
@@ -44,21 +48,80 @@ def _clean_secret_value(
     if cleaned.startswith(prefix):
         cleaned = cleaned[len(prefix):].strip().strip('"\'')
 
-    return cleaned or None
+    if cleaned in ("", "None", "null", "undefined"):
+        return None
+
+    return cleaned
 
 
-GROQ_API_KEY = _clean_secret_value(
-    getattr(env, "GROQ_API_KEY", None),
-    "GROQ_API_KEY",
-)
-ELEVENLABS_API_KEY = _clean_secret_value(
-    getattr(env, "ELEVENLABS_API_KEY", None),
-    "ELEVENLABS_API_KEY",
-)
-ELEVENLABS_VOICE_ID = _clean_secret_value(
-    getattr(env, "ELEVENLABS_VOICE_ID", None),
-    "ELEVENLABS_VOICE_ID",
-)
+def get_secret(name: str) -> str | None:
+    # 1. Try os.environ / os.getenv (live runtime secrets)
+    val = os.getenv(name)
+    cleaned = _clean_secret_value(val, name)
+    if cleaned:
+        return cleaned
+
+    # 2. Fallback: workers.env (module-level Cloudflare binding)
+    try:
+        val = getattr(env, name, None)
+        cleaned = _clean_secret_value(val, name)
+        if cleaned:
+            os.environ[name] = cleaned
+            return cleaned
+    except Exception:
+        pass
+
+    return None
+
+
+def sync_env(worker_env: Any = None) -> None:
+    if worker_env is not None:
+        for name in (
+            "GROQ_API_KEY",
+            "ELEVENLABS_API_KEY",
+            "ELEVENLABS_VOICE_ID",
+        ):
+            try:
+                val = getattr(worker_env, name, None)
+                cleaned = _clean_secret_value(val, name)
+                if cleaned:
+                    os.environ[name] = cleaned
+            except Exception:
+                pass
+    else:
+        for name in (
+            "GROQ_API_KEY",
+            "ELEVENLABS_API_KEY",
+            "ELEVENLABS_VOICE_ID",
+        ):
+            get_secret(name)
+
+
+def get_groq_api_key() -> str | None:
+    return get_secret("GROQ_API_KEY")
+
+
+def get_elevenlabs_api_key() -> str | None:
+    return get_secret("ELEVENLABS_API_KEY")
+
+
+def get_elevenlabs_voice_id() -> str | None:
+    return get_secret("ELEVENLABS_VOICE_ID")
+
+
+sync_env()
+
+
+def __getattr__(name: str) -> Any:
+    if name == "GROQ_API_KEY":
+        return get_groq_api_key()
+    if name == "ELEVENLABS_API_KEY":
+        return get_elevenlabs_api_key()
+    if name == "ELEVENLABS_VOICE_ID":
+        return get_elevenlabs_voice_id()
+    raise AttributeError(
+        f"module '{__name__}' has no attribute '{name}'"
+    )
 
 
 # ============================================================
@@ -181,7 +244,9 @@ async def groq_chat(
     json_mode: bool = False,
 ) -> dict[str, Any]:
 
-    if not GROQ_API_KEY:
+    api_key = get_groq_api_key()
+
+    if not api_key:
         raise RuntimeError(
             "GROQ_API_KEY is missing from Cloudflare environment."
         )
@@ -191,11 +256,9 @@ async def groq_chat(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "reasoning_effort": "none",
+        "reasoning_format": "hidden",
     }
-
-    if not json_mode:
-        payload["reasoning_effort"] = "none"
-        payload["reasoning_format"] = "hidden"
 
     if json_mode:
         payload["response_format"] = {
@@ -223,7 +286,7 @@ async def groq_chat(
         response = await client.post(
             GROQ_URL,
             headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json=payload,
@@ -245,6 +308,7 @@ async def groq_chat(
         print(
             "GROQ API ERROR:",
             response.status_code,
+            response.text,
         )
 
         raise RuntimeError(
@@ -262,21 +326,27 @@ async def groq_chat(
 
 async def elevenlabs_tts(
     text: str,
+    output_format: str = "mp3_22050_32",
 ) -> bytes:
 
-    if not ELEVENLABS_API_KEY:
+    text = clean_spoken_response(text)
+
+    api_key = get_elevenlabs_api_key()
+    voice_id = get_elevenlabs_voice_id()
+
+    if not api_key:
         raise RuntimeError(
             "ELEVENLABS_API_KEY is missing from Cloudflare environment."
         )
 
-    if not ELEVENLABS_VOICE_ID:
+    if not voice_id:
         raise RuntimeError(
             "ELEVENLABS_VOICE_ID is missing from Cloudflare environment."
         )
 
     url = (
         f"{ELEVENLABS_URL}/"
-        f"{ELEVENLABS_VOICE_ID}"
+        f"{voice_id}"
     )
 
     async with httpx.AsyncClient(
@@ -286,10 +356,10 @@ async def elevenlabs_tts(
         response = await client.post(
             url,
             params={
-                "output_format": "mp3_22050_32"
+                "output_format": output_format,
             },
             headers={
-                "xi-api-key": ELEVENLABS_API_KEY,
+                "xi-api-key": api_key,
                 "Content-Type": "application/json",
             },
             json={
@@ -1807,66 +1877,60 @@ async def chat(
 
 
 @app.post("/tts")
-async def elevenlabs_tts(
-    text: str,
-    output_format: str = "mp3_22050_32",
-) -> bytes:
+async def text_to_speech(
+    request: TTSRequest,
+):
 
-    text = clean_spoken_response(text)
+    text = request.text.strip()
 
-    print(
-        "TTS CLEANED RESPONSE:",
-        len(text),
-        "chars",
-    )
+    if not text:
 
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError(
-            "ELEVENLABS_API_KEY is missing from Cloudflare environment."
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
         )
 
-    if not ELEVENLABS_VOICE_ID:
-        raise RuntimeError(
-            "ELEVENLABS_VOICE_ID is missing from Cloudflare environment."
+    if len(text) > 5000:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Text is too long for a single "
+                "TTS request."
+            ),
         )
 
-    url = (
-        f"{ELEVENLABS_URL}/"
-        f"{ELEVENLABS_VOICE_ID}"
-    )
+    try:
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(60.0)
-    ) as client:
+        audio_bytes = await elevenlabs_tts(
+            text
+        )
 
-        response = await client.post(
-            url,
-            params={
-                "output_format": output_format,
-            },
+        return Response(
+            content=audio_bytes,
+            media_type="audio/mpeg",
             headers={
-                "xi-api-key": ELEVENLABS_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "text": text,
-                "model_id": "eleven_flash_v2_5",
+                "Content-Disposition": (
+                    "inline; filename=nextfit-tts.mp3"
+                )
             },
         )
 
-    if response.status_code >= 400:
+    except Exception as error:
 
         print(
-            "ELEVENLABS API ERROR:",
-            response.status_code,
-            response.text,
+            "ELEVENLABS TTS ERROR:",
+            type(error).__name__,
+            str(error),
         )
 
-        raise RuntimeError(
-            f"ElevenLabs API returned {response.status_code}"
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Text-to-speech service "
+                "temporarily unavailable."
+            ),
         )
-
-    return response.content
 
 # ============================================================
 # RESET
