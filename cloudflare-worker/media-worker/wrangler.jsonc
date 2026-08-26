@@ -1,0 +1,23 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "nextfit-ai-media",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-20",
+  "observability": {
+    "enabled": true
+  },
+  "services": [
+    {
+      "binding": "PYTHON_AI",
+      "service": "nextfit-ai-voice",
+      "entrypoint": "VoiceEntrypoint"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "api.vantixlab.info",
+      "custom_domain": true,
+      "zone_name": "vantixlab.info"
+    }
+  ]
+}

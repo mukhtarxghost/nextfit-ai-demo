@@ -8,12 +8,5 @@
   ],
   "observability": {
     "enabled": true
-  },
-  "routes": [
-    {
-      "pattern": "api.vantixlab.info",
-      "custom_domain": true,
-      "zone_name": "vantixlab.info"
-    }
-  ]
+  }
 }

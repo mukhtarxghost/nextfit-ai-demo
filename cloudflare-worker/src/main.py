@@ -1,5 +1,6 @@
 import json
 import re
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -116,7 +117,32 @@ class TTSRequest(BaseModel):
 # GLOBAL CONVERSATION STATE
 # ============================================================
 
-conversation = ConversationState()
+_default_conversation = ConversationState()
+_conversation_context: ContextVar[
+    ConversationState | None
+] = ContextVar(
+    "conversation_context",
+    default=None,
+)
+
+
+class _ConversationProxy:
+    """Resolve conversation state per request/task without global RPC state."""
+
+    def _target(self) -> ConversationState:
+        return (
+            _conversation_context.get()
+            or _default_conversation
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._target(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._target(), name, value)
+
+
+conversation = _ConversationProxy()
 
 MAX_HISTORY_MESSAGES = 6
 CHAT_MAX_TOKENS = 220
@@ -166,6 +192,10 @@ async def groq_chat(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+
+    if not json_mode:
+        payload["reasoning_effort"] = "none"
+        payload["reasoning_format"] = "hidden"
 
     if json_mode:
         payload["response_format"] = {
@@ -639,7 +669,27 @@ def deterministic_response(message: str) -> str | None:
 
 def clean_spoken_response(text: str) -> str:
 
+    original_length = len(text or "")
+    has_think_open = bool(
+        re.search(
+            r"<think(?:ing)?\b[^>]*>",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+    )
+    has_think_close = bool(
+        re.search(
+            r"</think(?:ing)?>",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+    )
+    cleanup_branch = "no_reasoning_cleanup"
+
     text = (text or "").strip()
+
+    if has_think_open and has_think_close:
+        cleanup_branch = "complete_think_block"
 
     text = re.sub(
         r"<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>",
@@ -660,10 +710,27 @@ def clean_spoken_response(text: str) -> str:
         flags=re.IGNORECASE,
     )
     if unmatched_reasoning:
+        cleanup_branch = "unclosed_reasoning"
         text = text[:unmatched_reasoning.start()]
 
     text = re.sub(r"<\|[^>]+\|>", "", text)
-    return re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(r"\s+", " ", text).strip()
+
+    print(
+        "TTS CLEANUP DIAGNOSTICS:",
+        "response_length=",
+        original_length,
+        "think_open=",
+        has_think_open,
+        "think_close=",
+        has_think_close,
+        "cleaned_length=",
+        len(cleaned),
+        "branch=",
+        cleanup_branch,
+    )
+
+    return cleaned
 
 
 def _has_phrase(
@@ -1516,7 +1583,7 @@ async def health():
     "/chat",
     response_model=ChatResponse,
 )
-async def chat(
+async def _chat_impl(
     request: ChatRequest,
 ):
 
@@ -1715,6 +1782,25 @@ async def chat(
     )
 
 
+async def chat(
+    request: ChatRequest,
+    conversation_state: ConversationState | None = None,
+) -> ChatResponse:
+    """Run chat using explicit state when supplied by the RPC boundary."""
+
+    if conversation_state is None:
+        return await _chat_impl(request)
+
+    token = _conversation_context.set(
+        conversation_state
+    )
+
+    try:
+        return await _chat_impl(request)
+    finally:
+        _conversation_context.reset(token)
+
+
 # ============================================================
 # ELEVENLABS TEXT TO SPEECH
 # ============================================================
@@ -1790,9 +1876,9 @@ async def elevenlabs_tts(
 @app.post("/reset")
 async def reset_conversation():
 
-    global conversation
+    global _default_conversation
 
-    conversation = ConversationState()
+    _default_conversation = ConversationState()
 
     return {
         "status": "reset",
