@@ -15,6 +15,21 @@ except ImportError:
     env = None
 
 from conversation import ConversationMessage, ConversationState
+from context import (
+    build_conversation_context,
+    build_known_info_text,
+    clear_pending_topic,
+    detect_active_intent,
+    detect_topic_interrupt,
+    handle_clarification,
+    is_clarification_request,
+    is_correction,
+    process_correction,
+    select_messages_for_llm,
+    should_resume_topic,
+    update_conversation_phase,
+    update_conversation_summary,
+)
 from models import LeadProfile
 from prompts import (
     LEAD_EXTRACTION_PROMPT,
@@ -207,7 +222,7 @@ class _ConversationProxy:
 
 conversation = _ConversationProxy()
 
-MAX_HISTORY_MESSAGES = 6
+MAX_CONTEXT_MESSAGES = 10
 CHAT_MAX_TOKENS = 220
 EXTRACTION_MAX_TOKENS = 320
 
@@ -542,10 +557,22 @@ def build_qualification_status() -> str:
 
 def build_system_prompt() -> str:
 
+    context_block = build_conversation_context(
+        conversation
+    )
+
+    known_block = build_known_info_text(
+        conversation.lead
+    )
+
     return (
         NEXTFIT_CHAT_PROMPT
         + "\n\n"
         + build_business_info()
+        + "\n\n"
+        + context_block
+        + "\n\n"
+        + known_block
         + "\n\n"
         + build_qualification_status()
         + "\n\n"
@@ -685,7 +712,7 @@ def _conversation_text() -> str:
 
     return "\n".join(
         f"{message.role.upper()}: {message.content}"
-        for message in conversation.messages[-MAX_HISTORY_MESSAGES:]
+        for message in conversation.messages
     )
 
 
@@ -699,6 +726,7 @@ def should_extract_lead(message: str) -> bool:
     skip_only = {
         "hello", "hi", "hey", "yes", "yeah", "yep", "okay",
         "ok", "sure", "thanks", "thank", "great", "cool",
+        "no", "nah", "nope", "right", "hmm", "um",
     }
 
     if set(words).issubset(skip_only):
@@ -710,6 +738,10 @@ def should_extract_lead(message: str) -> bool:
         "gain", "muscle", "weight", "name", "number", "phone",
         "live", "area", "pune", "available", "time", "membership",
         "personal", "trial", "problem", "prefer", "interested",
+        "actually", "meant", "change", "switch", "forget",
+        "saturday", "sunday", "monday", "tuesday", "wednesday",
+        "thursday", "friday", "tomorrow", "today", "evening",
+        "morning", "afternoon", "call", "callback", "contact",
     )
 
     return any(signal in words for signal in lead_signals)
@@ -1680,6 +1712,95 @@ async def _chat_impl(
     )
 
     conversation.turn_count += 1
+    conversation.last_user_answer = user_message
+
+    # --------------------------------------------------------
+    # CLARIFICATION DETECTION
+    # --------------------------------------------------------
+
+    if is_clarification_request(user_message):
+
+        clarification_response = handle_clarification(
+            conversation,
+            user_message,
+        )
+
+        if clarification_response:
+            conversation.messages.append(
+                ConversationMessage(
+                    role="assistant",
+                    content=clarification_response,
+                )
+            )
+
+            conversation.last_ai_response = (
+                clarification_response
+            )
+
+            conversation.consecutive_clarifications += 1
+
+            lead = conversation.lead
+            result = calculate_qualification(lead)
+
+            return ChatResponse(
+                response=clarification_response,
+                lead=lead,
+                score=result.score,
+                classification=result.classification,
+                reasons=result.reasons,
+                recommended_action=(
+                    result.recommended_action
+                ),
+            )
+
+    conversation.consecutive_clarifications = 0
+    conversation.clarification_requested = False
+
+    # --------------------------------------------------------
+    # CORRECTION DETECTION
+    # --------------------------------------------------------
+
+    if is_correction(user_message):
+        process_correction(
+            conversation,
+            user_message,
+        )
+        print(
+            "CORRECTION DETECTED:",
+            conversation.corrections[-1]
+            if conversation.corrections
+            else "unknown",
+        )
+
+    # --------------------------------------------------------
+    # ACTIVE INTENT DETECTION
+    # --------------------------------------------------------
+
+    new_intent = detect_active_intent(
+        user_message,
+        conversation.active_intent,
+    )
+
+    if new_intent and new_intent != conversation.active_intent:
+        conversation.previous_intent = (
+            conversation.active_intent
+        )
+        conversation.active_intent = new_intent
+        print(
+            "INTENT UPDATED:",
+            conversation.previous_intent,
+            "->",
+            new_intent,
+        )
+
+    # --------------------------------------------------------
+    # TOPIC INTERRUPT DETECTION
+    # --------------------------------------------------------
+
+    detect_topic_interrupt(
+        conversation,
+        user_message,
+    )
 
     # --------------------------------------------------------
     # EXTRACT ONLY WHEN THE TURN CONTAINS LEAD SIGNALS
@@ -1692,19 +1813,27 @@ async def _chat_impl(
         print("LEAD EXTRACTION SKIPPED")
 
     # --------------------------------------------------------
+    # UPDATE CONVERSATION PHASE
+    # --------------------------------------------------------
+
+    update_conversation_phase(conversation)
+
+    # --------------------------------------------------------
     # BUILD CONVERSATION
     # --------------------------------------------------------
 
-    messages = [
+    messages_for_llm = [
         {
             "role": "system",
             "content": build_system_prompt(),
         }
     ]
 
-    for message in conversation.messages[-MAX_HISTORY_MESSAGES:]:
+    selected = select_messages_for_llm(conversation)
 
-        messages.append(
+    for message in selected:
+
+        messages_for_llm.append(
             {
                 "role": message.role,
                 "content": message.content,
@@ -1726,7 +1855,7 @@ async def _chat_impl(
 
         if not response_text:
             completion = await groq_chat(
-                messages=messages,
+                messages=messages_for_llm,
                 temperature=0.75,
                 max_tokens=CHAT_MAX_TOKENS,
             )
@@ -1799,6 +1928,21 @@ async def _chat_impl(
             content=response_text,
         )
     )
+
+    conversation.last_ai_response = response_text
+
+    # --------------------------------------------------------
+    # CLEAR PENDING TOPIC IF RESUMED
+    # --------------------------------------------------------
+
+    if should_resume_topic(conversation):
+        clear_pending_topic(conversation)
+
+    # --------------------------------------------------------
+    # UPDATE CONVERSATION SUMMARY
+    # --------------------------------------------------------
+
+    update_conversation_summary(conversation)
 
     lead = conversation.lead
 

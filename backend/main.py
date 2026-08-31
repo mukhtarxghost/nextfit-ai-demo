@@ -12,6 +12,21 @@ from elevenlabs.client import ElevenLabs
 from pydantic import BaseModel, ValidationError
 
 from conversation import ConversationMessage, ConversationState
+from context import (
+    build_conversation_context,
+    build_known_info_text,
+    clear_pending_topic,
+    detect_active_intent,
+    detect_topic_interrupt,
+    handle_clarification,
+    is_clarification_request,
+    is_correction,
+    process_correction,
+    select_messages_for_llm,
+    should_resume_topic,
+    update_conversation_phase,
+    update_conversation_summary,
+)
 from models import LeadProfile
 from prompts import (
     LEAD_EXTRACTION_PROMPT,
@@ -334,10 +349,22 @@ Do not initiate human handoff before core qualification is complete.
 
 
 def build_system_prompt() -> str:
+    context_block = build_conversation_context(
+        conversation
+    )
+
+    known_block = build_known_info_text(
+        conversation.lead
+    )
+
     return (
         NEXTFIT_SYSTEM_PROMPT
         + "\n\n"
         + build_business_info()
+        + "\n\n"
+        + context_block
+        + "\n\n"
+        + known_block
         + "\n\n"
         + build_qualification_status()
         + "\n\n"
@@ -1476,12 +1503,105 @@ def chat(
     )
 
     conversation.turn_count += 1
+    conversation.last_user_answer = user_message
+
+    # --------------------------------------------------------
+    # CLARIFICATION DETECTION
+    # --------------------------------------------------------
+
+    if is_clarification_request(user_message):
+
+        clarification_response = handle_clarification(
+            conversation,
+            user_message,
+        )
+
+        if clarification_response:
+            conversation.messages.append(
+                ConversationMessage(
+                    role="assistant",
+                    content=clarification_response,
+                )
+            )
+
+            conversation.last_ai_response = (
+                clarification_response
+            )
+
+            lead = conversation.lead
+            result = calculate_qualification(lead)
+
+            return ChatResponse(
+                response=clarification_response,
+                lead=lead,
+                score=result.score,
+                classification=result.classification,
+                reasons=result.reasons,
+                recommended_action=(
+                    result.recommended_action
+                ),
+            )
+
+    conversation.consecutive_clarifications = 0
+    conversation.clarification_requested = False
+
+    # --------------------------------------------------------
+    # CORRECTION DETECTION
+    # --------------------------------------------------------
+
+    if is_correction(user_message):
+        process_correction(
+            conversation,
+            user_message,
+        )
+        print(
+            "CORRECTION DETECTED:",
+            conversation.corrections[-1]
+            if conversation.corrections
+            else "unknown",
+        )
+
+    # --------------------------------------------------------
+    # ACTIVE INTENT DETECTION
+    # --------------------------------------------------------
+
+    new_intent = detect_active_intent(
+        user_message,
+        conversation.active_intent,
+    )
+
+    if new_intent and new_intent != conversation.active_intent:
+        conversation.previous_intent = (
+            conversation.active_intent
+        )
+        conversation.active_intent = new_intent
+        print(
+            "INTENT UPDATED:",
+            conversation.previous_intent,
+            "->",
+            new_intent,
+        )
+
+    # --------------------------------------------------------
+    # TOPIC INTERRUPT DETECTION
+    # --------------------------------------------------------
+
+    detect_topic_interrupt(
+        conversation,
+        user_message,
+    )
 
     # --------------------------------------------------------
     # Extract BEFORE AI response
     # --------------------------------------------------------
 
     lead = extract_lead_information()
+
+    # --------------------------------------------------------
+    # UPDATE CONVERSATION PHASE
+    # --------------------------------------------------------
+
+    update_conversation_phase(conversation)
 
     # --------------------------------------------------------
     # Build conversation
@@ -1494,7 +1614,9 @@ def chat(
         }
     ]
 
-    for message in conversation.messages:
+    selected = select_messages_for_llm(conversation)
+
+    for message in selected:
 
         messages.append(
             {
@@ -1537,7 +1659,7 @@ def chat(
         if not response_text:
 
             response_text = (
-                "Hey! 👋 What brings you to NextFit today?"
+                "Hey! What brings you to NextFit today?"
             )
 
         print()
@@ -1582,6 +1704,21 @@ def chat(
             content=response_text,
         )
     )
+
+    conversation.last_ai_response = response_text
+
+    # --------------------------------------------------------
+    # CLEAR PENDING TOPIC IF RESUMED
+    # --------------------------------------------------------
+
+    if should_resume_topic(conversation):
+        clear_pending_topic(conversation)
+
+    # --------------------------------------------------------
+    # UPDATE CONVERSATION SUMMARY
+    # --------------------------------------------------------
+
+    update_conversation_summary(conversation)
 
     # --------------------------------------------------------
     # Extract again from complete conversation

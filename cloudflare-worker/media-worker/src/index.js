@@ -34,7 +34,17 @@ function emptyConversationState() {
     conversation_complete: false,
     handoff_required: false,
     turn_count: 0,
-    last_question: null,
+    conversation_phase: "greeting",
+    active_intent: "unknown",
+    previous_intent: null,
+    pending_topic: null,
+    last_ai_response: null,
+    last_user_answer: null,
+    last_question_asked: null,
+    corrections: [],
+    conversation_summary: null,
+    clarification_requested: false,
+    consecutive_clarifications: 0,
   };
 }
 

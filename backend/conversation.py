@@ -30,4 +30,66 @@ class ConversationState(BaseModel):
 
     turn_count: int = 0
 
-    last_question: Optional[str] = None
+    # --------------------------------------------------------
+    # Conversation phase
+    # --------------------------------------------------------
+
+    conversation_phase: Literal[
+        "greeting",
+        "discovery",
+        "qualification",
+        "action",
+        "closing",
+    ] = "greeting"
+
+    # --------------------------------------------------------
+    # Active intent tracking
+    # --------------------------------------------------------
+
+    active_intent: Literal[
+        "membership",
+        "personal_training",
+        "trial",
+        "class",
+        "general_information",
+        "existing_member",
+        "callback",
+        "other",
+        "unknown",
+    ] = "unknown"
+
+    previous_intent: Optional[str] = None
+
+    # --------------------------------------------------------
+    # Conversation context
+    # --------------------------------------------------------
+
+    pending_topic: Optional[str] = None
+
+    last_ai_response: Optional[str] = None
+
+    last_user_answer: Optional[str] = None
+
+    last_question_asked: Optional[str] = None
+
+    # --------------------------------------------------------
+    # Corrections / changes
+    # --------------------------------------------------------
+
+    corrections: List[str] = Field(
+        default_factory=list
+    )
+
+    # --------------------------------------------------------
+    # Conversation summary (rolling)
+    # --------------------------------------------------------
+
+    conversation_summary: Optional[str] = None
+
+    # --------------------------------------------------------
+    # Clarification tracking
+    # --------------------------------------------------------
+
+    clarification_requested: bool = False
+
+    consecutive_clarifications: int = 0
