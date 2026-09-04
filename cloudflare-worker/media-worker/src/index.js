@@ -1,12 +1,14 @@
 const SAMPLE_RATE = 8000;
 const CHANNELS = 1;
 const SAMPLE_WIDTH = 2;
-const SILENCE_MS = 750;
+const SILENCE_MS = 1000;
 const MIN_AUDIO_BYTES = 8000;
 const MAX_AUDIO_BYTES = 8000 * 2 * 30;
-const VAD_THRESHOLD = 500;
+const VAD_THRESHOLD = 400;
 const VAD_CHECK_INTERVAL_PACKETS = 5;
 const OUTBOUND_CHUNK_BYTES = 6400;
+const PENDING_MARK_TIMEOUT_MS = 15000;
+const KEEPALIVE_INTERVAL_MS = 30000;
 
 function emptyConversationState() {
   return {
@@ -45,6 +47,7 @@ function emptyConversationState() {
     conversation_summary: null,
     clarification_requested: false,
     consecutive_clarifications: 0,
+    last_extraction_turn: 0,
   };
 }
 
@@ -174,6 +177,14 @@ function sendAudioToExotel(server, state, audio) {
   state.pendingMark = markName;
   resetAudioBuffer(state);
 
+  state.pendingMarkTimer = setTimeout(() => {
+    if (state.pendingMark === markName) {
+      console.log("PENDING MARK TIMEOUT, clearing:", markName);
+      state.pendingMark = null;
+      resetAudioBuffer(state);
+    }
+  }, PENDING_MARK_TIMEOUT_MS);
+
   server.send(JSON.stringify({
     event: "mark",
     stream_sid: state.streamSid,
@@ -203,6 +214,8 @@ function createConnectionState() {
     conversationState: emptyConversationState(),
     outboundSequence: 0,
     pendingMark: null,
+    pendingMarkTimer: null,
+    keepaliveTimer: null,
   };
 }
 
@@ -212,6 +225,13 @@ function cancelSilenceTimer(state) {
   if (state.silenceTimer !== null) {
     clearTimeout(state.silenceTimer);
     state.silenceTimer = null;
+  }
+}
+
+function cancelPendingMarkTimer(state) {
+  if (state.pendingMarkTimer !== null) {
+    clearTimeout(state.pendingMarkTimer);
+    state.pendingMarkTimer = null;
   }
 }
 
@@ -263,7 +283,15 @@ function scheduleSilenceTimer(state, processUtterance) {
 
 function appendAudio(state, payload, processUtterance) {
   if (state.pendingMark) {
-    return;
+    const decoded = decodeBase64(payload);
+    if (decoded.byteLength >= 2 && pcmRms(decoded) >= VAD_THRESHOLD * 2) {
+      console.log("BARGE-IN DETECTED, clearing pending mark");
+      cancelPendingMarkTimer(state);
+      state.pendingMark = null;
+      resetAudioBuffer(state);
+    } else {
+      return;
+    }
   }
 
   const decoded = decodeBase64(payload);
@@ -313,7 +341,7 @@ function installMediaSocket(server, env) {
     try {
       const result = await env.PYTHON_AI.process_utterance({
         callSid: state.callSid,
-        pcm: pcm.buffer,
+        pcm: pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength),
         conversationState: state.conversationState,
       });
 
@@ -372,6 +400,18 @@ function installMediaSocket(server, env) {
         );
         state.callSid = start.call_sid || start.callSid || null;
         resetAudioBuffer(state);
+
+        if (state.keepaliveTimer !== null) {
+          clearInterval(state.keepaliveTimer);
+        }
+        state.keepaliveTimer = setInterval(() => {
+          if (state.connected) {
+            try {
+              server.send(JSON.stringify({ event: "ping" }));
+            } catch (_) {}
+          }
+        }, KEEPALIVE_INTERVAL_MS);
+
         console.log(
           "EXOTEL STREAM STARTED:",
           "stream=",
@@ -401,6 +441,7 @@ function installMediaSocket(server, env) {
         const markName = message.mark?.name;
         console.log("EXOTEL MARK:", markName);
         if (markName && markName === state.pendingMark) {
+          cancelPendingMarkTimer(state);
           state.pendingMark = null;
           resetAudioBuffer(state);
         }
@@ -416,6 +457,11 @@ function installMediaSocket(server, env) {
         console.log("EXOTEL STREAM STOPPED");
         state.started = false;
         cancelSilenceTimer(state);
+        cancelPendingMarkTimer(state);
+        if (state.keepaliveTimer !== null) {
+          clearInterval(state.keepaliveTimer);
+          state.keepaliveTimer = null;
+        }
 
         if (state.audioBytes >= MIN_AUDIO_BYTES) {
           void processUtterance();
@@ -430,6 +476,11 @@ function installMediaSocket(server, env) {
     state.connected = false;
     state.started = false;
     cancelSilenceTimer(state);
+    cancelPendingMarkTimer(state);
+    if (state.keepaliveTimer !== null) {
+      clearInterval(state.keepaliveTimer);
+      state.keepaliveTimer = null;
+    }
     resetAudioBuffer(state);
     console.log("EXOTEL WEBSOCKET CLOSED");
   });

@@ -593,7 +593,7 @@ def update_conversation_summary(
 # MESSAGE SELECTION
 # ============================================================
 
-MAX_CONTEXT_MESSAGES = 10
+MAX_CONTEXT_MESSAGES = 6
 
 
 def select_messages_for_llm(

@@ -93,3 +93,5 @@ class ConversationState(BaseModel):
     clarification_requested: bool = False
 
     consecutive_clarifications: int = 0
+
+    last_extraction_turn: int = 0

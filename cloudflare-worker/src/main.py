@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -252,6 +253,10 @@ ELEVENLABS_URL = (
 # ============================================================
 
 
+GROQ_MAX_RETRIES = 1
+GROQ_BASE_BACKOFF = 0.5
+
+
 async def groq_chat(
     messages: list[dict[str, str]],
     temperature: float,
@@ -294,44 +299,64 @@ async def groq_chat(
         json_mode,
     )
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(60.0)
-    ) as client:
+    last_error: Exception | None = None
 
-        response = await client.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+    for attempt in range(GROQ_MAX_RETRIES):
 
-    if response.status_code >= 400:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0)
+        ) as client:
+
+            response = await client.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+
         if response.status_code == 429:
-            retry_after = response.headers.get(
+
+            retry_after_raw = response.headers.get(
                 "retry-after"
             )
+            retry_after = float(retry_after_raw) if retry_after_raw else GROQ_BASE_BACKOFF * (2 ** attempt)
+            retry_after = min(retry_after, 15.0)
+
             print(
-                "GROQ 429 retry_after=",
-                retry_after or "unknown",
+                "GROQ 429 attempt=",
+                attempt + 1,
+                "of",
+                GROQ_MAX_RETRIES,
+                "retry_after=",
+                retry_after,
             )
+
+            if attempt < GROQ_MAX_RETRIES - 1:
+                await asyncio.sleep(retry_after)
+                continue
+
             raise GroqRateLimitError(
-                retry_after
+                retry_after_raw
             )
 
-        print(
-            "GROQ API ERROR:",
-            response.status_code,
-            response.text,
-        )
+        if response.status_code >= 400:
 
-        raise RuntimeError(
-            f"Groq API returned {response.status_code}"
-        )
+            print(
+                "GROQ API ERROR:",
+                response.status_code,
+                response.text,
+            )
 
-    print("GROQ CHAT SUCCESS")
-    return response.json()
+            raise RuntimeError(
+                f"Groq API returned {response.status_code}"
+            )
+
+        print("GROQ CHAT SUCCESS")
+        return response.json()
+
+    raise GroqRateLimitError()
 
 
 # ============================================================
@@ -720,34 +745,32 @@ def should_extract_lead(message: str) -> bool:
 
     words = re.findall(r"\b\w+\b", message.lower())
 
-    if len(words) < 2:
+    if len(words) < 3:
         return False
 
     skip_only = {
         "hello", "hi", "hey", "yes", "yeah", "yep", "okay",
         "ok", "sure", "thanks", "thank", "great", "cool",
         "no", "nah", "nope", "right", "hmm", "um",
+        "actually", "meant", "change", "switch", "forget",
     }
 
     if set(words).issubset(skip_only):
         return False
 
     lead_signals = (
-        "want", "need", "looking", "join", "start", "goal",
-        "train", "training", "workout", "gym", "fitness", "lose",
-        "gain", "muscle", "weight", "name", "number", "phone",
-        "live", "area", "pune", "available", "time", "membership",
-        "personal", "trial", "problem", "prefer", "interested",
-        "actually", "meant", "change", "switch", "forget",
-        "saturday", "sunday", "monday", "tuesday", "wednesday",
-        "thursday", "friday", "tomorrow", "today", "evening",
-        "morning", "afternoon", "call", "callback", "contact",
+        "membership", "personal", "training", "trial",
+        "join", "price", "pricing", "cost", "offer",
+        "discount", "sign", "register", "book", "consult",
     )
 
     return any(signal in words for signal in lead_signals)
 
 
-def deterministic_response(message: str) -> str | None:
+def deterministic_response(
+    message: str,
+    turn_count: int = 0,
+) -> str | None:
 
     normalized = re.sub(
         r"[^a-z0-9 ]",
@@ -756,15 +779,20 @@ def deterministic_response(message: str) -> str | None:
     ).strip()
 
     if normalized in {"hi", "hello", "hey"}:
-        return (
-            "Hey, welcome to NextFit. What brings you in today?"
-        )
+        if turn_count <= 1:
+            return (
+                "Hey, welcome to NextFit. "
+                "What brings you in today?"
+            )
+        return None
 
     if normalized in {"how are you", "how are you doing"}:
-        return (
-            "I'm good, thanks. How's it going? "
-            "What brings you to NextFit?"
-        )
+        if turn_count <= 2:
+            return (
+                "I'm good, thanks. How's it going? "
+                "What brings you to NextFit?"
+            )
+        return None
 
     return None
 
@@ -1391,9 +1419,8 @@ def normalize_lead_data(
             min(10, value),
         )
 
-    # LLM NEVER DIRECTLY CONTROLS HANDOFF
-
-    data["needs_human"] = False
+    if not isinstance(data.get("needs_human"), bool):
+        data["needs_human"] = False
 
     return data
 
@@ -1455,7 +1482,9 @@ def merge_lead_data(
         if value is not None:
             current[field] = value
 
-    current["needs_human"] = False
+    extracted_needs_human = extracted.get("needs_human")
+    if isinstance(extracted_needs_human, bool):
+        current["needs_human"] = extracted_needs_human
 
     return LeadProfile(
         **current
@@ -1806,9 +1835,15 @@ async def _chat_impl(
     # EXTRACT ONLY WHEN THE TURN CONTAINS LEAD SIGNALS
     # --------------------------------------------------------
 
-    if should_extract_lead(user_message):
+    turns_since_extraction = (
+        conversation.turn_count
+        - conversation.last_extraction_turn
+    )
+
+    if should_extract_lead(user_message) and turns_since_extraction >= 5:
         print("LEAD EXTRACTION RUN")
         await extract_lead_information()
+        conversation.last_extraction_turn = conversation.turn_count
     else:
         print("LEAD EXTRACTION SKIPPED")
 
@@ -1845,7 +1880,8 @@ async def _chat_impl(
     # --------------------------------------------------------
 
     response_text = deterministic_response(
-        user_message
+        user_message,
+        conversation.turn_count,
     )
 
     if response_text:
@@ -1887,9 +1923,16 @@ async def _chat_impl(
 
     except GroqRateLimitError as error:
 
+        conversation.messages.pop()
+
+        conversation.turn_count = max(
+            0,
+            conversation.turn_count - 1,
+        )
+
         response_text = (
-            "I'm sorry, I'm a little busy right now. "
-            "Could you give me a moment and try that again?"
+            "Sorry, I missed that. "
+            "Could you say that again?"
         )
 
         print(
