@@ -192,6 +192,7 @@ function createConnectionState() {
     started: false,
     streamSid: null,
     callSid: null,
+    callerPhone: null,
     audioChunks: [],
     audioBytes: 0,
     speechStarted: false,
@@ -313,8 +314,10 @@ function installMediaSocket(server, env) {
     try {
       const result = await env.PYTHON_AI.process_utterance({
         callSid: state.callSid,
+        callerPhone: state.callerPhone,
         pcm: pcm.buffer,
         conversationState: state.conversationState,
+        isFirstUtterance: state.outboundSequence === 0,
       });
 
       state.conversationState = result.conversationState;
@@ -371,6 +374,14 @@ function installMediaSocket(server, env) {
           || null
         );
         state.callSid = start.call_sid || start.callSid || null;
+        state.callerPhone = (
+          start.caller_number
+          || start.callerNumber
+          || start.From
+          || start.from
+          || start.customField
+          || null
+        );
         resetAudioBuffer(state);
         console.log(
           "EXOTEL STREAM STARTED:",
@@ -378,6 +389,8 @@ function installMediaSocket(server, env) {
           state.streamSid,
           "call=",
           state.callSid,
+          "phone=",
+          state.callerPhone,
         );
         return;
       }
@@ -419,6 +432,17 @@ function installMediaSocket(server, env) {
 
         if (state.audioBytes >= MIN_AUDIO_BYTES) {
           void processUtterance();
+        }
+
+        // Finalize the call session in the Python Worker
+        if (state.callSid) {
+          try {
+            await env.PYTHON_AI.end_call({
+              callSid: state.callSid,
+            });
+          } catch (endErr) {
+            console.log("END_CALL ERROR:", endErr?.name, endErr?.message);
+          }
         }
       }
     } catch (error) {

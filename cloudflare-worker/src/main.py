@@ -555,6 +555,50 @@ def build_qualification_status() -> str:
 # ============================================================
 
 
+def build_customer_history_text() -> str:
+    """Build a text block of customer history for the system prompt."""
+
+    history = conversation.customer_history
+    if not history:
+        return ""
+
+    customer = history.get("customer", {})
+    recent_calls = history.get("recent_calls", [])
+
+    parts = []
+
+    name = customer.get("name")
+    if name:
+        parts.append(f"Returning customer: {name}")
+
+    if recent_calls:
+        parts.append(f"Previous calls: {len(recent_calls)}")
+        for call in recent_calls[:3]:
+            summary_parts = []
+            if call.get("intent"):
+                summary_parts.append(f"interested in {call['intent']}")
+            if call.get("goal"):
+                summary_parts.append(f"goal: {call['goal']}")
+            if call.get("experience") and call["experience"] != "unknown":
+                summary_parts.append(f"experience: {call['experience']}")
+            if call.get("location"):
+                summary_parts.append(f"location: {call['location']}")
+            if call.get("summary"):
+                summary_parts.append(call["summary"][:100])
+            if summary_parts:
+                parts.append("- " + "; ".join(summary_parts))
+
+    if not parts:
+        return ""
+
+    return (
+        "CUSTOMER HISTORY:\n"
+        + "\n".join(parts)
+        + "\n\nNote: This is a returning customer. "
+        "Reference their history naturally without asking for information already provided."
+    )
+
+
 def build_system_prompt() -> str:
 
     context_block = build_conversation_context(
@@ -565,19 +609,29 @@ def build_system_prompt() -> str:
         conversation.lead
     )
 
-    return (
-        NEXTFIT_CHAT_PROMPT
-        + "\n\n"
-        + build_business_info()
-        + "\n\n"
-        + context_block
-        + "\n\n"
-        + known_block
-        + "\n\n"
-        + build_qualification_status()
-        + "\n\n"
-        + build_contact_status()
-    )
+    history_block = build_customer_history_text()
+
+    prompt_parts = [
+        NEXTFIT_CHAT_PROMPT,
+        "",
+        build_business_info(),
+        "",
+        context_block,
+        "",
+        known_block,
+    ]
+
+    if history_block:
+        prompt_parts.extend(["", history_block])
+
+    prompt_parts.extend([
+        "",
+        build_qualification_status(),
+        "",
+        build_contact_status(),
+    ])
+
+    return "\n".join(prompt_parts)
 
 
 # ============================================================

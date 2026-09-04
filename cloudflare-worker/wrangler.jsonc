@@ -8,5 +8,12 @@
   ],
   "observability": {
     "enabled": true
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "nextfit_db",
+      "database_name": "nextfit-db",
+      "database_id": "692e36fd-2b12-414d-80cf-bd83b64a4df6"
+    }
+  ]
 }

@@ -13,6 +13,7 @@ from main import (
     get_groq_api_key,
     sync_env,
 )
+from session import Session
 
 
 STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -168,6 +169,10 @@ async def _transcribe_audio(pcm_bytes: bytes) -> str | None:
 class VoiceEntrypoint(WorkerEntrypoint):
     """Utterance-level Python service called by the native media Worker."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sessions: dict[str, Session] = {}
+
     async def fetch(self, request):
         sync_env(self.env)
         return await asgi.fetch(
@@ -185,6 +190,8 @@ class VoiceEntrypoint(WorkerEntrypoint):
 
         request = _plain_value(request)
         call_sid = request.get("callSid")
+        caller_phone = request.get("callerPhone")
+        is_first = request.get("isFirstUtterance", False)
         pcm_bytes = _coerce_pcm(request.get("pcm"))
         conversation_state = ConversationState(
             **request["conversationState"]
@@ -195,7 +202,19 @@ class VoiceEntrypoint(WorkerEntrypoint):
             call_sid,
             len(pcm_bytes),
             "PCM bytes",
+            "first=" + str(is_first),
         )
+
+        # --- Session management ---
+        session = None
+        if call_sid and call_sid in self._sessions:
+            session = self._sessions[call_sid]
+            session.conversation_state = conversation_state
+        elif call_sid and is_first:
+            db = getattr(self.env, "nextfit_db", None)
+            session = Session(db=db, call_sid=call_sid)
+            self._sessions[call_sid] = session
+            await session.initialize(caller_phone=caller_phone)
 
         transcript = await _transcribe_audio(pcm_bytes)
 
@@ -206,10 +225,18 @@ class VoiceEntrypoint(WorkerEntrypoint):
                 "responseMetadata": None,
             }
 
+        # Persist user message
+        if session:
+            session.persist_user_message(transcript)
+
         chat_response = await chat(
             ChatRequest(message=transcript),
             conversation_state=conversation_state,
         )
+
+        # Persist assistant message and lead
+        if session:
+            session.persist_assistant_message(chat_response.response)
 
         audio = await elevenlabs_tts(
             chat_response.response,
@@ -230,3 +257,21 @@ class VoiceEntrypoint(WorkerEntrypoint):
                 ),
             },
         }
+
+    async def end_call(
+        self,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Finalize a call: persist lead, mark call completed."""
+
+        sync_env(self.env)
+
+        request = _plain_value(request)
+        call_sid = request.get("callSid")
+
+        if call_sid and call_sid in self._sessions:
+            session = self._sessions.pop(call_sid)
+            await session.finalize()
+            return {"status": "ok"}
+
+        return {"status": "no_session"}

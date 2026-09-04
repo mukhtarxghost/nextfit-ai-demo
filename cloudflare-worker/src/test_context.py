@@ -16,18 +16,6 @@ K. Name/goal early, 8+ turns later -> still remembered
 """
 
 import sys
-import os
-
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "cloudflare-worker",
-        "src",
-    ),
-)
 
 from conversation import ConversationMessage, ConversationState
 from context import (

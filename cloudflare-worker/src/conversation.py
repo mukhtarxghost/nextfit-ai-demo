@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -93,3 +93,9 @@ class ConversationState(BaseModel):
     clarification_requested: bool = False
 
     consecutive_clarifications: int = 0
+
+    # --------------------------------------------------------
+    # Customer history (loaded at call start, not persisted)
+    # --------------------------------------------------------
+
+    customer_history: Optional[Dict[str, Any]] = None
