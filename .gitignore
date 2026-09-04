@@ -3,3 +3,11 @@ venv/
 .env
 __pycache__/
 *.pyc
+node_modules/
+.wrangler/
+venv/
+.venv/
+cloudflare-worker/.venv/
+.env
+*.pyc
+__pycache__/
