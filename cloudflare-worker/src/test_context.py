@@ -600,10 +600,10 @@ def test_select_messages_large_conversation():
         )
 
     selected = select_messages_for_llm(state)
-    assert len(selected) == 10
+    assert len(selected) == 6
 
-    # Should be the last 10
-    assert selected[0].content == "Message 15"
+    # Should be the last 6
+    assert selected[0].content == "Message 17"
     assert selected[-1].content == "Response 19"
 
 
@@ -787,6 +787,42 @@ def test_intent_correction_overrides():
     )
 
     assert result == "personal_training"
+
+
+# ============================================================
+# REGRESSION: CLARIFICATION FALSE POSITIVES
+# ============================================================
+
+
+def test_clarification_not_triggered_by_what_about():
+    """'what about membership' must NOT be treated as clarification."""
+    assert not is_clarification_request("what about membership")
+
+
+def test_clarification_not_triggered_by_what_are_prices():
+    """'what are your prices' must NOT be treated as clarification."""
+    assert not is_clarification_request("what are your prices")
+
+
+def test_clarification_not_triggered_by_what_time():
+    """'what time do you open' must NOT be treated as clarification."""
+    assert not is_clarification_request("what time do you open")
+
+
+def test_clarification_triggered_by_standalone_what():
+    """Standalone 'what' IS a clarification request."""
+    assert is_clarification_request("what")
+
+
+def test_clarification_triggered_by_what_question_mark():
+    """'what?' IS a clarification request."""
+    assert is_clarification_request("what?")
+
+
+def test_max_context_messages_is_bounded():
+    """MAX_CONTEXT_MESSAGES must be 6 to keep Groq input bounded."""
+    from context import MAX_CONTEXT_MESSAGES
+    assert MAX_CONTEXT_MESSAGES == 6
 
 
 # ============================================================

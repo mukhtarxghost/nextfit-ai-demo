@@ -222,7 +222,7 @@ class _ConversationProxy:
 
 conversation = _ConversationProxy()
 
-MAX_CONTEXT_MESSAGES = 10
+MAX_CONTEXT_MESSAGES = 6
 CHAT_MAX_TOKENS = 220
 EXTRACTION_MAX_TOKENS = 320
 
@@ -766,7 +766,7 @@ def _conversation_text() -> str:
 
     return "\n".join(
         f"{message.role.upper()}: {message.content}"
-        for message in conversation.messages
+        for message in conversation.messages[-MAX_CONTEXT_MESSAGES:]
     )
 
 

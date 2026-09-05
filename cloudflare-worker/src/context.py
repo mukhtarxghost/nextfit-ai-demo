@@ -264,7 +264,7 @@ CLARIFICATION_PATTERNS = [
     r"\bcan you repeat\b",
     r"\brepeat that\b",
     r"\bsay that again\b",
-    r"\bwhat\b(?!\s+(?:kind|type|time|area|goal))",
+    r"^\s*what\s*[?.]*\s*$",
     r"\bhuh\b",
     r"\bpardon\b",
     r"\bsorry\b(?!.*(?:i|my|we))",
@@ -593,7 +593,7 @@ def update_conversation_summary(
 # MESSAGE SELECTION
 # ============================================================
 
-MAX_CONTEXT_MESSAGES = 10
+MAX_CONTEXT_MESSAGES = 6
 
 
 def select_messages_for_llm(

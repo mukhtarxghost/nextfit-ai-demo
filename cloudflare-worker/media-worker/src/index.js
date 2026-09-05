@@ -346,7 +346,7 @@ function installMediaSocket(server, env) {
     }
   };
 
-  server.addEventListener("message", (event) => {
+  server.addEventListener("message", async (event) => {
     try {
       if (typeof event.data !== "string") {
         return;

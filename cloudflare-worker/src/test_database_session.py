@@ -455,5 +455,51 @@ class TestBuildCustomerHistoryText(unittest.TestCase):
             _conversation_context.reset(token)
 
 
+# ============================================================
+# SYSTEM PROMPT SIZE REGRESSION TEST
+# ============================================================
+
+MAX_FRESH_SYSTEM_PROMPT_CHARS = 4000
+
+
+class TestSystemPromptSizeRegression(unittest.TestCase):
+    """Ensure the system prompt for a fresh call stays compact.
+
+    Before session-memory work, production Groq input was ~3-5k chars.
+    A prompt bloat regression expanded NEXTFIT_CHAT_PROMPT from 1.5k to
+    13k chars, pushing the first-request baseline to ~14k. This test
+    prevents that from recurring.
+    """
+
+    def test_fresh_call_system_prompt_is_compact(self):
+        from main import build_system_prompt, _conversation_context
+        from conversation import ConversationState
+
+        state = ConversationState()
+        token = _conversation_context.set(state)
+        try:
+            prompt = build_system_prompt()
+            self.assertLess(
+                len(prompt),
+                MAX_FRESH_SYSTEM_PROMPT_CHARS,
+                f"System prompt for fresh call is {len(prompt)} chars, "
+                f"exceeds {MAX_FRESH_SYSTEM_PROMPT_CHARS} limit. "
+                f"This likely means NEXTFIT_CHAT_PROMPT was bloated again.",
+            )
+        finally:
+            _conversation_context.reset(token)
+
+    def test_chat_prompt_base_is_compact(self):
+        from prompts import NEXTFIT_CHAT_PROMPT
+
+        self.assertLess(
+            len(NEXTFIT_CHAT_PROMPT),
+            2500,
+            f"NEXTFIT_CHAT_PROMPT is {len(NEXTFIT_CHAT_PROMPT)} chars, "
+            f"exceeds 2500 limit. Keep it concise — context blocks "
+            f"inject behavioral rules each turn.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
